@@ -72,12 +72,6 @@ class AsyncTelegramSink:
         self.cooldown = cooldown  # Seconds between identical error notifications
         self.error_cache_file = "src/telegram/error_cache.yaml"
 
-        # Ensure proper async loop handling
-        try:
-            self.loop = asyncio.get_running_loop()
-        except RuntimeError:
-            self.loop = asyncio.new_event_loop()
-
     async def _send_with_retry(self, message: str) -> bool:
         """Пытаемся отправить сообщение. В случае ошибки ждем экспоненциально дольше."""
         base_delay = 1
@@ -94,6 +88,7 @@ class AsyncTelegramSink:
                 )
                 return True
             except TelegramError as e:
+                internal_logger = logging.getLogger("AsyncTelegramSink")
                 if attempt == self.max_retries - 1:
                     internal_logger.error(f"Failed after {self.max_retries} attempts: {e}")
                     return False
@@ -117,6 +112,7 @@ class AsyncTelegramSink:
                 return (datetime.now() - last_sent).total_seconds() < self.cooldown
 
         except (FileNotFoundError, yaml.YAMLError) as e:
+            internal_logger = logging.getLogger("AsyncTelegramSink")
             internal_logger.warning(f"Error reading cache: {e}")
 
         return False
@@ -128,6 +124,7 @@ class AsyncTelegramSink:
         try:
             save_yaml_file(self.error_cache_file, cache)
         except (IOError, yaml.YAMLError) as e:
+            internal_logger = logging.getLogger("AsyncTelegramSink")
             internal_logger.error(f"Failed to update error cache: {e}")
 
     async def _process_message(self, message: str) -> None:
@@ -144,6 +141,7 @@ class AsyncTelegramSink:
                 error_cache = error_content
 
             if self._is_duplicate_error(error_cache):
+                internal_logger = logging.getLogger("AsyncTelegramSink")
                 internal_logger.info("Duplicate error suppressed")
                 return
 
@@ -153,23 +151,31 @@ class AsyncTelegramSink:
             if success:
                 self._update_error_cache(error_cache)
             else:
+                internal_logger = logging.getLogger("AsyncTelegramSink")
                 internal_logger.error("All retry attempts failed")
 
         except Exception:
             tb_str = traceback.format_exc()
+            internal_logger = logging.getLogger("AsyncTelegramSink")
             internal_logger.error(f"Critical error in message processing: {tb_str}")
 
     def __call__(self, message: str) -> None:
         """Loguru sink entry point"""
         try:
-            if self.loop.is_running():
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+
+            if loop and loop.is_running():
                 # If loop is already running, create a task
-                self.loop.create_task(self._process_message(message))
+                loop.create_task(self._process_message(message))
             else:
                 # Run in a new loop if necessary
-                self.loop.run_until_complete(self._process_message(message))
+                asyncio.run(self._process_message(message))
         except Exception:
             tb_str = traceback.format_exc()
+            internal_logger = logging.getLogger("AsyncTelegramSink")
             internal_logger.error(f"Failed to schedule Telegram message: {tb_str}")
 
 

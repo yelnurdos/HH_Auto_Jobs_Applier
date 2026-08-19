@@ -1,0 +1,12 @@
+services:
+  applier:
+    build:
+      context: .
+    image: hh-auto-jobs-applier:local
+    volumes:
+      - ./data_folder:/app/data_folder
+      - ./logs:/app/logs
+    environment:
+      - TZ=Asia/Almaty
+    # Один прогон и выход. Планировщик — systemd timer / cron, не restart: always.
+    restart: "no"

@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Tuple
 import yaml
 from Levenshtein import distance
 
-from src.constants import DUMMY_PERSONAL_INFO_FEMALE, DUMMY_PERSONAL_INFO_MALE
+from src.constants import DUMMY_PERSONAL_INFO_MALE
 from src.job_manager.playwright_manager import PlaywrightJobManager
 from src.logger_config import logger
 from src.utils.json_to_readable import transform_resume_data
@@ -123,11 +123,7 @@ class ResumeScraper:
 
     def anonymize_personal_information(self) -> None:
         """Анонимазовать персональные данные путем подмены их на данные-пустышки"""
-        sex = self.personal_information.get("sex")
-        if sex.lower() == "женский":
-            dummy_pesonal_info = DUMMY_PERSONAL_INFO_FEMALE
-        else:
-            dummy_pesonal_info = DUMMY_PERSONAL_INFO_MALE
+        dummy_pesonal_info = DUMMY_PERSONAL_INFO_MALE
         # анонимизировать графы "персональная информация" и "обо мне"
         for key, value in dummy_pesonal_info.items():
             if self.resume_info["personal_information"].get(key):
@@ -135,11 +131,7 @@ class ResumeScraper:
 
     def anonymize_text(self, input_: str) -> str:
         """If some key words are found in resume text - anonymize them"""
-        sex = self.resume_info["personal_information"].get("sex")
-        if sex.lower() == "женский":
-            dummy_pesonal_info = DUMMY_PERSONAL_INFO_FEMALE
-        else:
-            dummy_pesonal_info = DUMMY_PERSONAL_INFO_MALE
+        dummy_pesonal_info = DUMMY_PERSONAL_INFO_MALE
         for key, value in dummy_pesonal_info.items():
             # анонимизируем имя пользователя в ссылке на github
             if key == "github":
@@ -170,11 +162,7 @@ class ResumeScraper:
 
     def deanonymize_personal_information(self, output: str) -> str:
         """Деанонимазовать данные в ответе"""
-        sex = self.personal_information.get("sex")
-        if sex.lower() == "женский":
-            dummy_pesonal_info = DUMMY_PERSONAL_INFO_FEMALE
-        else:
-            dummy_pesonal_info = DUMMY_PERSONAL_INFO_MALE
+        dummy_pesonal_info = DUMMY_PERSONAL_INFO_MALE
         for key, value_to_replace in dummy_pesonal_info.items():
             if key == "github":
                 for i, github_link in enumerate(self.github_links):

@@ -6,7 +6,7 @@ import traceback
 from abc import ABC, abstractmethod
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import httpx
 import yaml
@@ -18,6 +18,7 @@ from langchain_core.prompt_values import StringPromptValue
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 from langchain_google_genai import ChatGoogleGenerativeAI, HarmBlockThreshold, HarmCategory
+from langchain_cohere import ChatCohere
 from Levenshtein import distance
 
 import src.llm.prompts as prompts
@@ -34,6 +35,64 @@ config = load_app_config()
 LLM_MODEL = config.get("LLM_MODEL", "gpt-5-nano")
 LLM_MODEL_TYPE = config.get("LLM_MODEL_TYPE", "openai")
 TEMPERATURE = config.get("TEMPERATURE", 0.4)
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+MAX_HTTP_RETRIES = 3
+DEFAULT_TOKEN_PRICES = {"price_per_input_token": 1.5e-7, "price_per_output_token": 6e-7}
+
+
+def _proxy_list(llm_proxy: Union[str, List[str], None]) -> List[str]:
+    if not llm_proxy:
+        return [""]
+    if isinstance(llm_proxy, str):
+        return [llm_proxy] if llm_proxy else [""]
+    proxies = [p for p in llm_proxy if p is not None]
+    return proxies if proxies else [""]
+
+
+def _proxy_label(proxy: str) -> str:
+    if not proxy:
+        return "без прокси"
+    return proxy.split("@")[-1]
+
+
+def _openrouter_fallback_ids(raw: Any) -> List[str]:
+    """Преобразовать FALLBACK_MODELS в список slug'ов OpenRouter."""
+    ids: List[str] = []
+    for item in raw or []:
+        if isinstance(item, str) and item.strip():
+            ids.append(item.strip())
+            continue
+        if not isinstance(item, dict):
+            continue
+        model = (item.get("model") or "").strip()
+        typ = (item.get("type") or "").strip()
+        if not model:
+            continue
+        if "/" in model:
+            ids.append(model)
+        elif typ == "openai":
+            ids.append(f"openai/{model}")
+        elif typ == "gemini":
+            ids.append(f"google/{model}")
+        elif typ == "cohere":
+            ids.append(f"cohere/{model}")
+        elif typ == "deepseek":
+            ids.append(f"deepseek/{model}")
+        else:
+            ids.append(model)
+    return ids
+
+
+def _prices_for_model(model_name: str) -> Dict[str, float]:
+    candidates = [model_name, LLM_MODEL]
+    if model_name and "/" in model_name:
+        candidates.append(model_name.split("/")[-1])
+    if LLM_MODEL and "/" in LLM_MODEL:
+        candidates.append(LLM_MODEL.split("/")[-1])
+    for name in candidates:
+        if name and name in PRICE_DICT:
+            return PRICE_DICT[name]
+    return DEFAULT_TOKEN_PRICES
 
 
 class AIModel(ABC):
@@ -54,8 +113,9 @@ class OpenAIModel(AIModel):
         logger.info("Получен доступ к модели через OpenAI API")
         prompt_messages = [SystemMessage(content=prompts.custom_instructions)] + prompt.messages
         # случайно выбираем одну прокси за другой, пока запрос к LLM не пройдет
-        llm_proxies = self.llm_proxy.copy()
+        llm_proxies = _proxy_list(self.llm_proxy)
         random.shuffle(llm_proxies)
+        errors = []
 
         for proxy in llm_proxies:
             try:
@@ -73,17 +133,20 @@ class OpenAIModel(AIModel):
                     presence_penalty=0,
                     frequency_penalty=0,
                     timeout=60,
-                    # Try to minimize reasoning if the model supports it.
-                    reasoning_effort="low",
                 )
                 response = model.invoke(prompt_messages)
+                if response is None:
+                    raise RuntimeError("OpenAI вернула пустой ответ")
                 return response
-            except Exception:
+            except Exception as e:
                 tb_str = traceback.format_exc()
                 logger.error(
-                    f"Ошибка доступа к LLM с использованием прокси {proxy.split('@')[-1]}: \n Traceback: {tb_str}"
+                    f"Ошибка доступа к LLM с использованием прокси {_proxy_label(proxy)}: \n Traceback: {tb_str}"
                 )
+                errors.append(str(e))
                 time.sleep(3)
+
+        raise RuntimeError(f"OpenAI недоступна ни через один прокси. Ошибки: {errors}")
 
 
 class GeminiModel(AIModel):
@@ -97,13 +160,14 @@ class GeminiModel(AIModel):
     def invoke(self, prompt: ChatPromptTemplate) -> BaseMessage:
         logger.info("Получен доступ к модели через Gemini API")
         prompt_messages = [SystemMessage(content=prompts.custom_instructions)] + prompt.messages
-        # случайно выбираем одну прокси за другой, пока запрос к LLM не пройдет
-        llm_proxies = self.llm_proxy.copy()
+        llm_proxies = _proxy_list(self.llm_proxy)
         random.shuffle(llm_proxies)
+        errors = []
 
         for proxy in llm_proxies:
             try:
-                os.environ["https_proxy"] = proxy
+                if proxy:
+                    os.environ["https_proxy"] = proxy
                 model = ChatGoogleGenerativeAI(
                     model=self.model,
                     google_api_key=self.google_api_key,
@@ -123,19 +187,102 @@ class GeminiModel(AIModel):
                     },
                 )
                 response = model.invoke(prompt_messages)
-                del os.environ["https_proxy"]
+                if response is None:
+                    raise RuntimeError("Gemini вернула пустой ответ")
                 return response
-            except Exception:
+            except Exception as e:
                 tb_str = traceback.format_exc()
                 logger.error(
-                    f"Ошибка доступа к LLM с использованием прокси {proxy.split('@')[-1]}: \n Traceback: {tb_str}"
+                    f"Ошибка доступа к LLM с использованием прокси {_proxy_label(proxy)}: \n Traceback: {tb_str}"
                 )
+                errors.append(str(e))
                 time.sleep(3)
             finally:
-                try:
-                    del os.environ["https_proxy"]
-                except KeyError:
-                    pass
+                os.environ.pop("https_proxy", None)
+
+        raise RuntimeError(f"Gemini недоступна ни через один прокси. Ошибки: {errors}")
+
+
+class OpenRouterModel(AIModel):
+    """OpenAI-совместимый доступ к OpenRouter с серверным fallback по списку моделей."""
+
+    def __init__(
+        self,
+        api_key: str,
+        llm_model: str,
+        llm_proxy: Union[str, List[str], None] = None,
+        fallback_models: Optional[List[str]] = None,
+    ) -> None:
+        self.llm_proxy = llm_proxy
+        self.model_name = llm_model
+        self.api_key = api_key
+        self.fallback_models = fallback_models or []
+
+    def invoke(self, prompt: ChatPromptTemplate) -> BaseMessage:
+        logger.info(
+            f"Запрос через OpenRouter: {self.model_name}"
+            + (f", fallback={self.fallback_models}" if self.fallback_models else "")
+        )
+        prompt_messages = [SystemMessage(content=prompts.custom_instructions)] + prompt.messages
+        llm_proxies = _proxy_list(self.llm_proxy)
+        random.shuffle(llm_proxies)
+        errors = []
+        extra_body = {"models": self.fallback_models} if self.fallback_models else None
+
+        for proxy in llm_proxies:
+            try:
+                http_client = httpx.Client(proxy=proxy, timeout=60.0) if proxy else None
+                chat_kwargs = {
+                    "model": self.model_name,
+                    "openai_api_key": self.api_key,
+                    "base_url": OPENROUTER_BASE_URL,
+                    "http_client": http_client,
+                    "temperature": TEMPERATURE,
+                    "timeout": 60,
+                    "default_headers": {
+                        "HTTP-Referer": "https://github.com/yelnurdo/HH_Auto_Jobs_Applier",
+                        "X-Title": "HH Auto Jobs Applier",
+                    },
+                }
+                if extra_body:
+                    chat_kwargs["extra_body"] = extra_body
+                model = ChatOpenAI(**chat_kwargs)
+                response = model.invoke(prompt_messages)
+                if response is None:
+                    raise RuntimeError("OpenRouter вернул пустой ответ")
+                actual = getattr(response, "response_metadata", {}) or {}
+                logger.info(
+                    f"OpenRouter ответил моделью: {actual.get('model_name') or actual.get('model') or self.model_name}"
+                )
+                return response
+            except Exception as e:
+                tb_str = traceback.format_exc()
+                logger.error(
+                    f"Ошибка OpenRouter с прокси {_proxy_label(proxy)}: \n Traceback: {tb_str}"
+                )
+                errors.append(str(e))
+                time.sleep(3)
+
+        raise RuntimeError(f"OpenRouter недоступен ни через один прокси. Ошибки: {errors}")
+
+
+class CohereModel(AIModel):
+    """Получить доступ к модели Cohere"""
+
+    def __init__(self, api_key: str, llm_model: str) -> None:
+        self.model_name = llm_model
+        self.cohere_api_key = api_key
+
+    def invoke(self, prompt: ChatPromptTemplate) -> BaseMessage:
+        logger.info("Получен доступ к модели через Cohere API")
+        prompt_messages = [SystemMessage(content=prompts.custom_instructions)] + prompt.messages
+        model = ChatCohere(
+            model=self.model_name,
+            cohere_api_key=self.cohere_api_key,
+            temperature=TEMPERATURE,
+        )
+        response = model.invoke(prompt_messages)
+        return response
 
 
 # class ClaudeModel(AIModel):
@@ -208,29 +355,115 @@ class GeminiModel(AIModel):
 #         return response
 
 
+class FallbackLLM(AIModel):
+    """
+    Обертка для использования нескольких LLM с механизмом переключения (fallback).
+    Если основная модель падает, пробуем следующую по списку.
+    """
+    def __init__(self, models: List[AIModel]):
+        self.models = models
+
+    def invoke(self, prompt: ChatPromptTemplate) -> BaseMessage:
+        errors = []
+        for model in self.models:
+            try:
+                logger.info(f"Попытка использования модели: {model.__class__.__name__}")
+                result = model.invoke(prompt)
+                if result is None:
+                    raise RuntimeError(f"{model.__class__.__name__} вернула пустой ответ")
+                return result
+            except Exception as e:
+                error_msg = f"Ошибка при использовании модели {model.__class__.__name__}: {e}"
+                logger.error(error_msg)
+                errors.append(error_msg)
+        
+        # Если ни одна модель не сработала
+        raise Exception(f"Все модели для fallback вышли из строя. Ошибки: {errors}")
+
+
 class AIAdapter:
     """Класс для получения доступа к LLM моделям разных фирм через API"""
 
-    def __init__(self, api_key: str, llm_proxy: str):
-        self.model = self._create_model(api_key, llm_proxy)
+    def __init__(self, secrets: Dict[str, str], llm_proxy: str):
+        fallback_configs = config.get("FALLBACK_MODELS", []) or []
 
-    def _create_model(self, api_key: str, llm_proxy: str) -> AIModel:
-        logger.info(f"Используем {LLM_MODEL_TYPE} от {LLM_MODEL}")
+        if LLM_MODEL_TYPE == "openrouter":
+            self.primary_model = self._create_single_model(
+                LLM_MODEL_TYPE,
+                LLM_MODEL,
+                secrets,
+                llm_proxy,
+                fallback_models=_openrouter_fallback_ids(fallback_configs),
+            )
+            self.model = self.primary_model
+            return
 
-        if LLM_MODEL_TYPE == "gemini":
-            return GeminiModel(api_key, LLM_MODEL, llm_proxy)
-        elif LLM_MODEL_TYPE == "openai":
-            return OpenAIModel(api_key, LLM_MODEL, llm_proxy)
-        # elif LLM_MODEL_TYPE == "gigachat":
-        #     return GigaChatModel(api_key, LLM_MODEL)
-        # elif LLM_MODEL_TYPE == "claude":
-        #     return ClaudeModel(api_key, LLM_MODEL)
-        # elif LLM_MODEL_TYPE == "ollama":
-        #     return OllamaModel(LLM_MODEL, llm_api_url)
-        # elif LLM_MODEL_TYPE == "huggingface":
-        #     return HuggingFaceModel(api_key, LLM_MODEL)
+        self.primary_model = self._create_single_model(
+            LLM_MODEL_TYPE,
+            LLM_MODEL,
+            secrets,
+            llm_proxy,
+        )
+
+        if fallback_configs:
+            models_list = [self.primary_model]
+            for fb_conf in fallback_configs:
+                if isinstance(fb_conf, str):
+                    logger.warning(
+                        f"Пропуск fallback '{fb_conf}': для {LLM_MODEL_TYPE} нужен объект {{type, model}}"
+                    )
+                    continue
+                fb_type = fb_conf.get("type")
+                fb_model_name = fb_conf.get("model")
+                if fb_type and fb_model_name:
+                    try:
+                        fb_model = self._create_single_model(
+                            fb_type, fb_model_name, secrets, llm_proxy
+                        )
+                        models_list.append(fb_model)
+                    except Exception as e:
+                        logger.error(
+                            f"Не удалось инициализировать fallback модель {fb_type}/{fb_model_name}: {e}"
+                        )
+            self.model = FallbackLLM(models_list) if len(models_list) > 1 else self.primary_model
         else:
-            raise ValueError(f"Неподдерживаемый тип модели: {LLM_MODEL_TYPE}")
+            self.model = self.primary_model
+
+    def _create_single_model(
+        self,
+        model_type: str,
+        model_name: str,
+        secrets: Dict[str, str],
+        llm_proxy: str,
+        fallback_models: Optional[List[str]] = None,
+    ) -> AIModel:
+        logger.info(f"Инициализация модели: {model_type} ({model_name})")
+
+        if model_type == "openrouter":
+            api_key = secrets.get("openrouter_api_key") or secrets.get("llm_api_key")
+            if not api_key:
+                raise ValueError("No OpenRouter API key found")
+            return OpenRouterModel(api_key, model_name, llm_proxy, fallback_models)
+
+        if model_type == "gemini":
+            api_key = secrets.get("gemini_api_key") or secrets.get("llm_api_key")
+            if not api_key:
+                raise ValueError("No Gemini API key found")
+            return GeminiModel(api_key, model_name, llm_proxy)
+
+        if model_type == "openai":
+            api_key = secrets.get("openai_api_key") or secrets.get("llm_api_key")
+            if not api_key:
+                raise ValueError("No OpenAI API key found")
+            return OpenAIModel(api_key, model_name, llm_proxy)
+
+        if model_type == "cohere":
+            api_key = secrets.get("cohere_api_key") or secrets.get("llm_api_key")
+            if not api_key:
+                raise ValueError("No Cohere API key found")
+            return CohereModel(api_key, model_name)
+
+        raise ValueError(f"Неподдерживаемый тип модели: {model_type}")
 
     def invoke(self, prompt: str) -> str:
         return self.model.invoke(prompt)
@@ -239,7 +472,7 @@ class AIAdapter:
 class LLMLogger:
     """Класс для логирования всех событий, происходящих при работе с LLM"""
 
-    def __init__(self, llm: GeminiModel):
+    def __init__(self, llm: Any): # Changed type hint to Any to accept FallbackLLM
         self.llm = llm
         logger.info(f"LLMLogger успешно инициализирован, используем LLM: {llm}")
 
@@ -294,30 +527,31 @@ class LLMLogger:
             logger.error(f"Ошибка при получении текущего времени: {tb_str}")
             raise
 
+        input_tokens = 0
+        output_tokens = 0
+        total_tokens = 0
         try:
-            token_usage = parsed_reply["usage_metadata"]
-            output_tokens = token_usage["output_tokens"]
-            input_tokens = token_usage["input_tokens"]
-            total_tokens = token_usage["total_tokens"]
-            logger.info(
-                f"Использование токенов - Input: {input_tokens}, Output: {output_tokens}, Всего: {total_tokens}"
-            )
+            token_usage = parsed_reply.get("usage_metadata")
+            if token_usage:
+                output_tokens = token_usage.get("output_tokens", 0)
+                input_tokens = token_usage.get("input_tokens", 0)
+                total_tokens = token_usage.get("total_tokens", 0)
+                logger.info(
+                    f"Использование токенов - Input: {input_tokens}, Output: {output_tokens}, Всего: {total_tokens}"
+                )
         except KeyError as e:
             logger.error(f"Ошибка ключа в структуре parsed_reply: {str(e)}")
             raise
 
         try:
-            model_name = parsed_reply["response_metadata"]["model_name"]
+            model_name = parsed_reply["response_metadata"].get("model_name") or LLM_MODEL
             logger.info(f"Название модели: {model_name}")
         except KeyError as e:
             logger.error(f"Ошибка ключа в response_metadata: {str(e)}")
             raise
 
         try:
-            # Рассчитать общую стоимость запроса
-            prices = PRICE_DICT.get(
-                LLM_MODEL, {"price_per_input_token": 1.5e-7, "price_per_output_token": 6e-7}
-            )
+            prices = _prices_for_model(model_name)
             price_per_input_token = prices["price_per_input_token"]
             price_per_output_token = prices["price_per_output_token"]
             total_cost = (input_tokens * price_per_input_token) + (
@@ -344,25 +578,28 @@ class LLMLogger:
 class LoggerChatModel:
     """
     Класс для взаимодействия с языковой моделью (LLM) и логирования всех операций.
-    Этот класс обрабатывает запросы к языковой модели, парсит и логирует ответы, а также обрабатывает
-    возможные ошибки, такие как превышение лимита запросов или сетевые ошибки.
     """
 
-    def __init__(self, llm: GeminiModel):
+
+
+    def __init__(self, llm: AIAdapter):
         self.llm = llm
-        logger.info(f"LoggerChatModel успешно инициализирован, LLM: {llm}")
+        logger.info(f"LoggerChatModel успешно инициализирован")
 
     def __call__(self, messages: List[Dict[str, str]]) -> str:
         """
         Выполняем вызов LLM, обрабатываем ответ и логируем весь процесс.
         """
-        # logger.debug(f"Вход в метод __call__ с сообщениями: {messages}")
+        retries = 0
         while True:
             try:
                 logger.info("Попытка вызова LLM")
 
                 reply = self.llm.invoke(messages)
                 logger.debug(f"Ответ от LLM: {reply}")
+
+                if reply is None:
+                    raise RuntimeError("LLM вернула пустой ответ")
 
                 parsed_reply = self.parse_llmresult(reply)
                 logger.info(f"Успешно распарсили результат работы LLM: {parsed_reply}")
@@ -372,7 +609,11 @@ class LoggerChatModel:
                 return reply
 
             except httpx.HTTPStatusError as e:
+                retries += 1
                 logger.error(f"Произошла ошибка HTTPStatusError: {str(e)}")
+                if retries >= MAX_HTTP_RETRIES:
+                    logger.error(f"Исчерпаны {MAX_HTTP_RETRIES} HTTP-ретрая, пробрасываем ошибку")
+                    raise
                 if e.response.status_code == 429:
                     retry_after = e.response.headers.get("retry-after")
                     retry_after_ms = e.response.headers.get("retry-after-ms")
@@ -400,12 +641,18 @@ class LoggerChatModel:
                         f"Произошла ошибка HTTP со статусом: {e.response.status_code}, ожидание 30 секунд перед повторной попыткой"
                     )
                     time.sleep(30)
+            except Exception as e:
+                logger.error(f"Unexpected error in LoggerChatModel: {e}")
+                raise e
 
     def parse_llmresult(self, llmresult: AIMessage) -> Dict[str, Dict]:
         """Парсим результат работы LLM"""
         logger.info("Парсинг результата LLM")
 
         try:
+            if llmresult is None:
+                logger.warning("LLM returned None, returning empty response")
+                return {"content": "", "response_metadata": {}, "id": "", "usage_metadata": {}}
             if hasattr(llmresult, "usage_metadata") and llmresult.usage_metadata is not None:
                 content = llmresult.content
                 response_metadata = llmresult.response_metadata
@@ -415,7 +662,8 @@ class LoggerChatModel:
                 parsed_result = {
                     "content": content,
                     "response_metadata": {
-                        "model_name": response_metadata.get("model_name", ""),
+                        "model_name": response_metadata.get("model_name")
+                        or response_metadata.get("model", ""),
                         "system_fingerprint": response_metadata.get("system_fingerprint", ""),
                         "finish_reason": response_metadata.get("finish_reason", ""),
                         "logprobs": response_metadata.get("logprobs", None),
@@ -487,15 +735,11 @@ class LoggerChatModel:
 class GPTAnswerer:
     """
     Класс для обработки вопросов по резюме и формированию ответов на них с использованием LLM.
-    Класс включает методы для обработки и определения разделов резюме, таких как
-    личная информация, опыт работы и прочее, на основе переданных вопросов.
-    Предназначен для автоматизации ответов на вопросы по резюме,
-    а также написания сопроводительных писем.
     """
 
-    def __init__(self, llm_api_key: str, llm_proxy: str):
+    def __init__(self, secrets: Dict[str, str], llm_proxy: str):
         self.job = None
-        self.ai_adapter = AIAdapter(llm_api_key, llm_proxy)
+        self.ai_adapter = AIAdapter(secrets, llm_proxy)
         self.llm_cheap = LoggerChatModel(self.ai_adapter)
         self.chains = {
             "job_is_interesting": self._create_pydantic_chain(

@@ -137,6 +137,8 @@ class SearchConfig(BaseModel):
 
 
 class Secrets(BaseModel):
+    model_config = {"extra": "allow"}
+
     hh_login: str
     hh_password: str
     llm_api_key: str
@@ -144,6 +146,14 @@ class Secrets(BaseModel):
     tg_token: str
     tg_api_id: Optional[str] = ""
     tg_api_hash: Optional[str] = ""
+    openai_api_key: Optional[str] = ""
+    gemini_api_key: Optional[str] = ""
+    cohere_api_key: Optional[str] = ""
+    openrouter_api_key: Optional[str] = ""
+    tg_chat_id: Optional[str] = ""
+    tg_err_topic_id: Optional[Union[str, int]] = None
+    tg_captcha_topic_id: Optional[Union[str, int]] = None
+    tg_report_topic_id: Optional[Union[str, int]] = None
 
     @field_validator("tg_api_id", mode="before")
     @classmethod

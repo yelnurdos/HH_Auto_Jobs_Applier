@@ -1,43 +1,22 @@
 # Личные данные-пустышки для анонимизации (мужской пол)
 DUMMY_PERSONAL_INFO_MALE = {
-    "first_name": "Аристаний",
-    "first_name_2": "Ари́станий",
-    "first_name_3": "Ариста́ний",
-    "middle_name": "Астромерович",
-    "last_name": "Звяегольцев",
-    "last_name_2": "Звягольцев",
-    # "birthday": "03.05.1993",
-    "phone": "+7 (933) 575-35-35",
-    "email": "aristaniy93@gmail.com",
-    "telegram": "https://t.me/aristaniy93",
-    "whatsapp": "https://wa.me/aristaniy93",
-    "other_site": "https://www.aristaniy93.ru",
-    "habr_career": "https://career.habr.ru/aristaniy93",
-    "linkedin": "https://linkedin.com/in/aristaniy-zvyagoltsev-f3e57c712",
-    "github": "https://github.com/aristaniy93",
-    "telegram_2": "@aristaniy93",
-    "telegram_3": "aristaniy93",
-}
-
-# Личные данные-пустышки для анонимизации (женский пол)
-DUMMY_PERSONAL_INFO_FEMALE = {
-    "first_name": "Аристания",
-    "first_name_2": "Ари́стания",
-    "first_name_3": "Ариста́ния",
-    "middle_name": "Астромеровна",
-    "last_name": "Звяегольцева",
-    "last_name_2": "Звягольцева",
-    # "birthday": "03.05.1993",
-    "phone": "+7 (933) 575-35-35",
-    "email": "aristaniya93@gmail.com",
-    "telegram": "https://t.me/aristaniya93",
-    "whatsapp": "https://wa.me/aristaniya93",
-    "other_site": "https://www.aristaniya93.ru",
-    "habr_career": "https://career.habr.ru/aristaniya93",
-    "linkedin": "https://linkedin.com/in/aristaniya-zvyagoltseva-f3e57c712",
-    "github": "https://github.com/aristaniya93",
-    "telegram_2": "@aristaniya93",
-    "telegram_3": "aristaniya93",
+    "first_name": "Yelnur",
+    "first_name_2": "Елнур",
+    "first_name_3": "Елнұр",
+    "middle_name": "Мейрбекұлы",
+    "last_name": "Dossymov",
+    "last_name_2": "Досымов",
+    "birthday": "14.12.2002",
+    "phone": "+7 (707) 477 9686",
+    "email": "yelnurdos@gmail.com",
+    "telegram": "https://t.me/yelnurdos",
+    # "whatsapp": "https://wa.me/aristaniy93",
+    # "other_site": "https://www.aristaniy93.ru",
+    # "habr_career": "https://career.habr.ru/aristaniy93",
+    # "linkedin": "https://linkedin.com/in/aristaniy-zvyagoltsev-f3e57c712",
+    "github": "https://github.com/yelnurdo",
+    # "telegram_2": "@aristaniy93",
+    # "telegram_3": "aristaniy93",
 }
 
 # Пути к файлам логов и настроек
@@ -52,6 +31,10 @@ BROWSER_STORAGE_STATE = "data_folder/browser_session/hh_state.json"
 # Словарь для подсчета стоимости запроса к модели
 PRICE_DICT = {
     "gpt-4o": {
+        "price_per_input_token": 2.5e-6,
+        "price_per_output_token": 1e-5,
+    },
+    "openai/gpt-4o": {
         "price_per_input_token": 2.5e-6,
         "price_per_output_token": 1e-5,
     },

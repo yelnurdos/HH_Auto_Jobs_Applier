@@ -76,7 +76,25 @@ class TelegramReportSender:
         except RuntimeError:
             self.loop = asyncio.new_event_loop()
 
-    def send_telegram_report(
+    async def send_application_notification(
+        self,
+        job_title: str,
+        company: str,
+        link: str,
+        cover_letter: str
+    ) -> None:
+        """
+        Отправляет уведомление о поданной заявке на вакансию.
+        """
+        message = f"✅ **Отправлен отклик!**\n\n"
+        message += f"👔 **Должность:** {job_title}\n"
+        message += f"🏢 **Компания:** {company}\n"
+        message += f"🔗 **Ссылка:** {link}\n\n"
+        message += f"📄 **Сопроводительное письмо:**\n\n{cover_letter}"
+
+        await self._send_chunked_messages(message, "")
+
+    async def send_telegram_report(
         self,
         login: str,
         resume: Dict[str, Any],
@@ -146,7 +164,7 @@ class TelegramReportSender:
             message += resume_recommendations
 
         self.message = message
-        asyncio.run(self._send_chunked_messages(self.message, header))
+        await self._send_chunked_messages(self.message, header)
 
     async def _send_chunked_messages(self, message, header):
         """

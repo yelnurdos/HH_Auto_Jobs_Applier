@@ -919,8 +919,18 @@ class PlaywrightJobManager:
 
     async def get_vacancy_full_info(self, vacancy_url: str) -> Dict[str, Any]:
         """Получает полную информацию о вакансии для LLM."""
-        await self.page.goto(vacancy_url)
-        logger.info(f"Переход на страницу: {vacancy_url}")
+        try:
+            await self.page.goto(vacancy_url, timeout=60000)
+            logger.info(f"Переход на страницу: {vacancy_url}")
+        except Exception as e:
+            logger.warning(f"Ошибка перехода на страницу {vacancy_url}: {e}, пробуем еще раз...")
+            try:
+                await asyncio.sleep(2)
+                await self.page.goto(vacancy_url, timeout=60000)
+                logger.info(f"Повторный переход успешен: {vacancy_url}")
+            except Exception as e2:
+                logger.error(f"Не удалось открыть страницу вакансии {vacancy_url}: {e2}")
+                raise
 
         async def get_text_or_empty(selector: str) -> str:
             el = self.page.locator(selector)
@@ -1437,11 +1447,11 @@ class PlaywrightJobManager:
 
     async def _get_first_name(self) -> str:
         """Получает имя из профиля."""
-        first_name = self.page.locator('[data-qa="profile-common-card-firstname"]')
-        if await first_name.count() > 0:
-            first_name = await first_name.first.text_content()
-            first_name = sanitize_text(first_name, lowercase=False)
-        return first_name
+        first_name_locator = self.page.locator('[data-qa="profile-common-card-firstname"]')
+        if await first_name_locator.count() > 0:
+            first_name = await first_name_locator.first.text_content()
+            return sanitize_text(first_name, lowercase=False)
+        return ""
 
     async def _get_other_links(self) -> Tuple[str, str]:
         """Получает другие ссылки (LinkedIn, Habr Career)."""
@@ -1461,19 +1471,19 @@ class PlaywrightJobManager:
 
     async def _get_middle_name(self) -> str:
         """Получает отчество из профиля."""
-        middle_name = self.page.locator('[data-qa*="profile-common-edit-middleName"]')
-        if await middle_name.count() > 0:
-            middle_name = await middle_name.first.get_attribute("value")
-            middle_name = sanitize_text(middle_name, lowercase=False)
-        return middle_name
+        middle_name_locator = self.page.locator('[data-qa*="profile-common-edit-middleName"]')
+        if await middle_name_locator.count() > 0:
+            middle_name = await middle_name_locator.first.get_attribute("value")
+            return sanitize_text(middle_name, lowercase=False)
+        return ""
 
     async def _get_birthday(self) -> str:
         """Получает дату рождения."""
-        birthday = self.page.locator('[data-qa="profile-common-edit-birthday"]')
-        if await birthday.count() > 0:
-            birthday = await birthday.first.get_attribute("value")
-            birthday = sanitize_text(birthday)
-        return birthday
+        birthday_locator = self.page.locator('[data-qa="profile-common-edit-birthday"]')
+        if await birthday_locator.count() > 0:
+            birthday = await birthday_locator.first.get_attribute("value")
+            return sanitize_text(birthday)
+        return ""
 
     async def _get_sex_citizenship_and_legal_auth(self) -> Tuple[str, str, str]:
         """Получает пол, гражданство и разрешение на работу."""
@@ -1494,11 +1504,11 @@ class PlaywrightJobManager:
 
     async def _get_last_name(self) -> str:
         """Получает фамилию."""
-        last_name = self.page.locator('[data-qa="profile-common-card-lastname"]')
-        if await last_name.count() > 0:
-            last_name = await last_name.first.text_content()
-            last_name = sanitize_text(last_name, lowercase=False)
-        return last_name
+        last_name_locator = self.page.locator('[data-qa="profile-common-card-lastname"]')
+        if await last_name_locator.count() > 0:
+            last_name = await last_name_locator.first.text_content()
+            return sanitize_text(last_name, lowercase=False)
+        return ""
 
     async def _get_telegram(self) -> str:
         """Получает Telegram из контактов."""

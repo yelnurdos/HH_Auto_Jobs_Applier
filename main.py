@@ -98,7 +98,7 @@ async def create_and_run_bot(
     await manager.initialize()
 
     try:
-        gpt_answerer_component = GPTAnswerer(llm_api_key, llm_proxy)
+        gpt_answerer_component = GPTAnswerer(secrets, llm_proxy)
         resume_component = ResumeScraper(
             manager, job_title, parameters.get("resume_id"), gpt_answerer_component
         )
@@ -107,9 +107,6 @@ async def create_and_run_bot(
 
         bot = BotFacade(resume_component, search_component, apply_component)
         await bot.set_parameters(parameters)
-        if not apply_component.check_the_last_search_time():
-            logger.warning("Последний поиск был меньше суток назад, завершаем работу")
-            return
         await bot.set_resume()
         bot.set_search_parameters(parameters)
         bot.set_gpt_answerer(gpt_answerer_component, parameters)

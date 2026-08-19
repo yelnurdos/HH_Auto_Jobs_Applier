@@ -121,37 +121,144 @@ class TestGeminiModel:
         assert mock_sleep.called
         assert response.content == "Success response"
 
+    @patch("src.llm.llm_manager.ChatGoogleGenerativeAI")
+    @patch("src.llm.llm_manager.os")
+    def test_invoke_raises_when_all_proxies_fail(
+        self, mock_os, mock_chat_gemini, mock_api_key, mock_llm_proxy
+    ):
+        from src.llm.llm_manager import GeminiModel
+
+        mock_chat_gemini.return_value.invoke.side_effect = Exception("API Error")
+        model = GeminiModel(mock_api_key, "gemini-test-model", mock_llm_proxy)
+
+        with patch("src.llm.llm_manager.time.sleep"):
+            with pytest.raises(RuntimeError, match="Gemini недоступна"):
+                model.invoke(ChatPromptTemplate.from_template("Test prompt"))
+
+
+@pytest.fixture
+def mock_secrets(mock_api_key):
+    return {"llm_api_key": mock_api_key, "gemini_api_key": mock_api_key}
+
+
+class TestProxyAndFallbackHelpers:
+    def test_openrouter_fallback_ids_from_strings_and_dicts(self):
+        from src.llm.llm_manager import _openrouter_fallback_ids
+
+        assert _openrouter_fallback_ids(
+            [
+                "google/gemini-2.5-flash",
+                {"type": "openai", "model": "gpt-4o-mini"},
+                {"type": "gemini", "model": "gemini-2.5-flash"},
+            ]
+        ) == [
+            "google/gemini-2.5-flash",
+            "openai/gpt-4o-mini",
+            "google/gemini-2.5-flash",
+        ]
+
+
+class TestOpenRouterModel:
+    @patch("src.llm.llm_manager.ChatOpenAI")
+    def test_invoke_passes_fallback_models(self, mock_chat_openai, mock_api_key, mock_llm_proxy):
+        from src.llm.llm_manager import OpenRouterModel
+
+        mock_instance = MagicMock()
+        mock_instance.invoke.return_value = AIMessage(
+            content="ok", response_metadata={"model": "openai/gpt-4o"}
+        )
+        mock_chat_openai.return_value = mock_instance
+
+        prompt = ChatPromptTemplate.from_template("Test prompt")
+        model = OpenRouterModel(
+            mock_api_key,
+            "openai/gpt-4o",
+            mock_llm_proxy,
+            fallback_models=["google/gemini-2.5-flash"],
+        )
+        with patch("src.llm.llm_manager.time.sleep"):
+            response = model.invoke(prompt)
+
+        assert response.content == "ok"
+        assert mock_chat_openai.call_args.kwargs["base_url"] == "https://openrouter.ai/api/v1"
+        assert mock_chat_openai.call_args.kwargs["extra_body"] == {
+            "models": ["google/gemini-2.5-flash"]
+        }
+
+
+class TestFallbackLLM:
+    def test_switches_to_next_model(self):
+        from src.llm.llm_manager import FallbackLLM
+
+        first = MagicMock()
+        first.invoke.side_effect = RuntimeError("down")
+        second = MagicMock()
+        second.invoke.return_value = AIMessage(content="fallback-ok")
+
+        result = FallbackLLM([first, second]).invoke(ChatPromptTemplate.from_template("x"))
+        assert result.content == "fallback-ok"
+
+    def test_raises_when_all_fail(self):
+        from src.llm.llm_manager import FallbackLLM
+
+        first = MagicMock()
+        first.invoke.side_effect = RuntimeError("a")
+        second = MagicMock()
+        second.invoke.side_effect = RuntimeError("b")
+
+        with pytest.raises(Exception, match="Все модели"):
+            FallbackLLM([first, second]).invoke(ChatPromptTemplate.from_template("x"))
+
 
 class TestAIAdapter:
     @patch("src.llm.llm_manager.GeminiModel")
     @patch("src.llm.llm_manager.LLM_MODEL_TYPE", "gemini")
     @patch("src.llm.llm_manager.LLM_MODEL", "gemini-test-model")
     def test_create_gemini_model(
-        self, mock_gemini_model, mock_config, mock_api_key, mock_llm_proxy
+        self, mock_gemini_model, mock_config, mock_secrets, mock_llm_proxy
     ):
         from src.llm.llm_manager import AIAdapter
 
-        adapter = AIAdapter(mock_api_key, mock_llm_proxy)
+        adapter = AIAdapter(mock_secrets, mock_llm_proxy)
 
-        mock_gemini_model.assert_called_once_with(mock_api_key, "gemini-test-model", mock_llm_proxy)
+        mock_gemini_model.assert_called_once_with(
+            mock_secrets["llm_api_key"], "gemini-test-model", mock_llm_proxy
+        )
         assert adapter.model == mock_gemini_model.return_value
+
+    @patch("src.llm.llm_manager.OpenRouterModel")
+    @patch("src.llm.llm_manager.config", {"FALLBACK_MODELS": ["google/gemini-2.5-flash"]})
+    @patch("src.llm.llm_manager.LLM_MODEL_TYPE", "openrouter")
+    @patch("src.llm.llm_manager.LLM_MODEL", "openai/gpt-4o")
+    def test_create_openrouter_model(self, mock_or_model, mock_secrets, mock_llm_proxy):
+        from src.llm.llm_manager import AIAdapter
+
+        adapter = AIAdapter(mock_secrets, mock_llm_proxy)
+
+        mock_or_model.assert_called_once_with(
+            mock_secrets["llm_api_key"],
+            "openai/gpt-4o",
+            mock_llm_proxy,
+            ["google/gemini-2.5-flash"],
+        )
+        assert adapter.model == mock_or_model.return_value
 
     @patch("src.llm.llm_manager.LLM_MODEL_TYPE", "unsupported")
     @patch("src.llm.llm_manager.LLM_MODEL", "unsupported-model")
-    def test_unsupported_model_type(self, mock_config, mock_api_key, mock_llm_proxy):
+    def test_unsupported_model_type(self, mock_config, mock_secrets, mock_llm_proxy):
         from src.llm.llm_manager import AIAdapter
 
         with pytest.raises(ValueError, match="Неподдерживаемый тип модели: unsupported"):
-            AIAdapter(mock_api_key, mock_llm_proxy)
+            AIAdapter(mock_secrets, mock_llm_proxy)
 
-    def test_invoke(self, mock_config, mock_api_key, mock_llm_proxy):
+    def test_invoke(self, mock_config, mock_secrets, mock_llm_proxy):
         from src.llm.llm_manager import AIAdapter
 
-        with patch.object(AIAdapter, "_create_model") as mock_create_model:
+        with patch.object(AIAdapter, "_create_single_model") as mock_create_model:
             mock_model = MagicMock()
             mock_create_model.return_value = mock_model
 
-            adapter = AIAdapter(mock_api_key, mock_llm_proxy)
+            adapter = AIAdapter(mock_secrets, mock_llm_proxy)
             adapter.invoke("test prompt")
 
             mock_model.invoke.assert_called_once_with("test prompt")
@@ -216,6 +323,25 @@ class TestLoggerChatModel:
         assert mock_llm.invoke.call_count == 2
         mock_sleep.assert_called_once_with(1)  # Should sleep for 1 second
         assert response.content == "Success after retry"
+
+    @patch("src.llm.llm_manager.time.sleep")
+    def test_call_stops_after_max_http_retries(self, mock_sleep):
+        from src.llm.llm_manager import LoggerChatModel, MAX_HTTP_RETRIES
+
+        mock_response = MagicMock()
+        mock_response.status_code = 429
+        mock_response.headers = {"retry-after": "1"}
+        http_error = httpx.HTTPStatusError(
+            "Rate limit exceeded", request=MagicMock(), response=mock_response
+        )
+        mock_llm = MagicMock()
+        mock_llm.invoke.side_effect = http_error
+        logger_model = LoggerChatModel(mock_llm)
+
+        with pytest.raises(httpx.HTTPStatusError):
+            logger_model([{"role": "user", "content": "Hello"}])
+
+        assert mock_llm.invoke.call_count == MAX_HTTP_RETRIES
 
     def test_parse_llmresult(self):
         from src.llm.llm_manager import LoggerChatModel

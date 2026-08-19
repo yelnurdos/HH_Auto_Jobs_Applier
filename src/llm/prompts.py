@@ -31,8 +31,8 @@ Follow strict rules:
 # Промпт для определения степени интересности вакансии
 job_is_interesting = """
 You are an expert in recruitment.
-Evaluate whether the provided resume meets the requirements specified in the job description and whether job description meets the search parameters.
-Determine if the candidate is suitable for this job based on the provided information.
+Evaluate whether the provided resume is broadly compatible with the job description.
+The candidate wants to apply to as many relevant jobs as possible. Be LENIENT in your evaluation.
 ##Job Description##
 ```
 {job_description}
@@ -46,16 +46,16 @@ Determine if the candidate is suitable for this job based on the provided inform
 {search_parameters}
 ```
 ##Additional Rules##
-- Identify key requirements from the job description, distinguishing strict requirements (mandatory) from soft requirements (desirable).
-- Determine relevant qualifications from the resume and skills list.
-- Compare qualifications to the requirements, ensuring all strict requirements are met.
-- A 1-year difference in experience is allowed if applicable, as experience is typically a strict requirement.
-- Assign a suitability score from 1 to 100, where 1 means that candidate meets no requirements, and 100 means that candidate meets all requirements.
-- If at least one of the skills levels in resume is significanly lower than the requirements (e.g. required level is "advanced" but in resume it is "elementary"), subtract 20 points from the overall score.
-- If vacancy requires year or less of experience and candidate has 4 or more years of experience, subtract 10 points from the overall score.
-- If the job aligns with one or more of the candidate’s interests, add 10 point to the overall score.
-- If vacancy doesn't match one or more of search parameters, subtract 20 points from the overall score for each search parameter that it doesn't match.
-- Provide a brief justification for the score, indicating which requirements are met and which are not.
+- The candidate is interested in ALL of the following areas: Python development, Machine Learning, AI Engineering, Prompt Engineering, Backend development (FastAPI, Flask, Django), Data Analytics, Data Engineering, Data Science. If the job falls into ANY of these categories, it is a MATCH.
+- DO NOT penalize for job title mismatches. For example, if search parameters say "Machine Learning Engineer" but the vacancy is "Python Developer" or "Backend Developer" or "Data Engineer" — this is still a match.
+- DO NOT penalize for experience differences. The candidate wants to apply regardless of whether they have more or less experience than required.
+- DO NOT penalize for missing specific skills or frameworks. If the candidate knows Python and the job requires Python + some frameworks the candidate doesn't list, still consider it a match.
+- DO NOT penalize for language level differences. The candidate's actual language levels are: Kazakh (Native), English (C1), Russian (C2). Ignore any language levels shown in the resume if they differ.
+- The ONLY reasons to give a LOW score (below 50) are:
+  1. The job has absolutely nothing to do with Python, ML, AI, Data, or Backend development (e.g., it's a sales role, marketing, or manual labor).
+  2. The job requires a completely different tech stack with zero overlap (e.g., only Java/C#/.NET with no Python at all).
+- For any job related to Python, ML, AI, Data Analytics, Data Engineering, or Backend — assign a score of 75 or higher.
+- Provide a brief justification for the score.
 ##Output Format##
 {format_instructions}
 """

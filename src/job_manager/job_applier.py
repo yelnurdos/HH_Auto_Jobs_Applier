@@ -159,15 +159,8 @@ class JobApplier:
 
     async def start_applying(self) -> None:
         """Разослать отклики всем работодателям на всех страницах"""
-        # определяем время старта поиска
-        if self.cache.get("last_run"):
-            last_run = datetime.fromisoformat(self.cache["last_run"])
-            # если это не первый запуск - увеличиваем время последнего поиска на 24 часа
-            # и записываем его как последний поиск (во избежание дрейфа времени запуска программы)
-            self.cache["last_run"] = (last_run + timedelta(hours=24)).isoformat()
-        else:
-            last_run = datetime.now().isoformat()
-            self.cache["last_run"] = last_run
+        # записываем время старта поиска
+        self.cache["last_run"] = datetime.now().isoformat()
         result = ""
         # пишем рекомендации по улучшению резюме
         self.resume_improvement_recommendations()
@@ -217,7 +210,7 @@ class JobApplier:
             # записываем время последнего поиска и отсылаем отчет
             if self.previous_apply_number < self.success_applies_num:
                 logger.info("Отсылаем отчёт о проделанной работе в Telegram")
-                self.send_report()
+                await self.send_report()
                 self._write_the_last_search_time()
 
     async def send_repsonse(self, vacancy: Dict[str, Any]) -> str:
@@ -231,44 +224,45 @@ class JobApplier:
         # если вакансия еще не встречалась и компания не в черном списке
         # - начать процесс отклика на вакансию
         if self._is_blacklisted(self._sanitize_text(company_name)):
-            apply_result = "Skip", "Вакансия в черном списке"
+            apply_result = "Skip", "Вакансия в черном списке", ""
             logger.warning("Вакансия в черном списке, пропускаем")
             pause(1, 2)
-        elif SEARCH_MODE is True:
-            is_applied, reason = self._job_description_is_already_met(job["vacancy_id"])
         else:
-            is_applied, reason = self._is_already_applied_to_job_or_company(job)
-        if is_applied:
-            apply_result = "Skip", reason
-            logger.warning(f"Пропускаем вакансию по причине: {reason}")
-            pause(1, 2)
-        else:
-            # задать вакансию в LLM для оценки
-            self.gpt_answerer.set_job(job)
-            if MONKEY_MODE is True:
-                # в 'режиме обезьяны' любая вакансия считается интересной
-                job_is_interesting_data = {"score": 100, "reasoning": "Monkey mode"}
+            if SEARCH_MODE is True:
+                is_applied, reason = self._job_description_is_already_met(job["vacancy_id"])
             else:
-                # иначе просить LLM оценить, является ли вакансия интересной или нет
-                job_is_interesting_data = self.gpt_answerer.job_is_interesting()
-            # откликнуться на вакансию только если она интересна
-            job_is_interesting = job_is_interesting_data["score"] >= JOB_IS_INTERESTING_THRESH
-            if job_is_interesting:
-                apply_result = await self.apply_job(
-                    vacancy, company_name, company_job_title, job, job_is_interesting_data
-                )
-                result, reason = apply_result
-                # если вакансия пропускается по причине отсутствия информации, добавить ее в список вакансий,
-                # информация о которых потом будет отправлена клиенту
-                if result == "Skip" and reason.startswith("Не смогли"):
-                    self._collect_job_info(company_job_title, vacancy["alternate_url"], reason)
-            elif job_is_interesting is None:
-                apply_result = "Error", "Ошибка при вызове LLM."
+                is_applied, reason = self._is_already_applied_to_job_or_company(job)
+            if is_applied:
+                apply_result = "Skip", reason, ""
+                logger.warning(f"Пропускаем вакансию по причине: {reason}")
+                pause(1, 2)
             else:
-                apply_result = "Skip", "Вакансия не интересна"
-                logger.debug("Вакансия не интересна, пропускаем")
+                # задать вакансию в LLM для оценки
+                self.gpt_answerer.set_job(job)
+                if MONKEY_MODE is True:
+                    # в 'режиме обезьяны' любая вакансия считается интересной
+                    job_is_interesting_data = {"score": 100, "reasoning": "Monkey mode"}
+                else:
+                    # иначе просить LLM оценить, является ли вакансия интересной или нет
+                    job_is_interesting_data = self.gpt_answerer.job_is_interesting()
+                # откликнуться на вакансию только если она интересна
+                job_is_interesting = job_is_interesting_data["score"] >= JOB_IS_INTERESTING_THRESH
+                if job_is_interesting:
+                    apply_result = await self.apply_job(
+                        vacancy, company_name, company_job_title, job, job_is_interesting_data
+                    )
+                    result, reason, cover_letter_text = apply_result
+                    # если вакансия пропускается по причине отсутствия информации, добавить ее в список вакансий,
+                    # информация о которых потом будет отправлена клиенту
+                    if result == "Skip" and reason.startswith("Не смогли"):
+                        self._collect_job_info(company_job_title, vacancy["alternate_url"], reason)
+                elif job_is_interesting is None:
+                    apply_result = "Error", "Ошибка при вызове LLM.", ""
+                else:
+                    apply_result = "Skip", "Вакансия не интересна", ""
+                    logger.debug("Вакансия не интересна, пропускаем")
 
-        result, _ = apply_result
+        result, _ = apply_result[:2]
         # если находимся в одном из режимов сбора информации - не ведем статистику по вакансиям
         if SEARCH_MODE is True or SKILL_STAT_MODE is True:
             return "OK"
@@ -285,6 +279,18 @@ class JobApplier:
                 f"Количество вакансий, на которые успешно откликнулись: {self.success_applies_num}"
             )
             logger.info(f"Общее количество успешных откликов: {self.total_applies_num}")
+
+            # Send Telegram notification
+            try:
+                bot_sender = TelegramReportSender()
+                await bot_sender.send_application_notification(
+                    job_title=company_job_title,
+                    company=company_name,
+                    link=vacancy["alternate_url"],
+                    cover_letter=apply_result[2]
+                )
+            except Exception as e:
+                logger.error(f"Failed to send application notification: {e}")
         if result != "Limit":
             self._save_company(job, apply_result, vacancy)
         # если страница была обработана быстрее, чем за минимальное время -
@@ -316,8 +322,9 @@ class JobApplier:
         job_title: str,
         job: dict,
         job_is_interesting_data: Dict[str, Any],
-    ) -> Tuple[str, str]:
+    ) -> Tuple[str, str, str]:
         """Откликнуться на вакансию"""
+        cover_letter_text = ""
         try:
             skills = self._process_skill_string(job.get("skills", ""))
             if self.fixed_cover_letter:
@@ -346,7 +353,7 @@ class JobApplier:
                 logger.info(
                     "Находимся в режиме отладки поиска вакансий - не откликаемся на вакансии"
                 )
-                return "Skip", "SEARCH_MODE"
+                return "Skip", "SEARCH_MODE", cover_letter_text
             elif SKILL_STAT_MODE is True:
                 # если находимся в режиме сбора статистики по навыкам - не откликаемся на вакансии,
                 # только сохраняем статистику по навыкам в файл
@@ -359,22 +366,23 @@ class JobApplier:
                 logger.info(
                     "Находимся в режиме сбора статистики по навыкам - не откликаемся на вакансии"
                 )
-                return "Skip", "SKILL_STAT_MODE"
+                return "Skip", "SKILL_STAT_MODE", cover_letter_text
             else:
-                return await self.manager.apply_to_vacancy(
+                result, reason = await self.manager.apply_to_vacancy(
                     vacancy["alternate_url"],
                     cover_letter_text,
                     self.gpt_answerer,
                     self.resume_component,
                 )
+                return result, reason, cover_letter_text
         except Exception as e:
             tb_str = traceback.format_exc()
             logger.error(
                 f"Неизвестная ошибка на странице {vacancy.get('alternate_url')} во время отклика на вакансию {job_title} компании {company_name}\n{tb_str}"
             )
-            return "Error", str(e)
+            return "Error", str(e), ""
 
-    def send_report(self) -> None:
+    async def send_report(self) -> None:
         """
         После завершения рассылки резюме послать отчет, который будет содержать
         количество вакансий, на которые приложения откликнулось, список вакансий,
@@ -382,7 +390,7 @@ class JobApplier:
         а также рекомендации по улучшению резюме
         """
         bot = TelegramReportSender()
-        bot.send_telegram_report(
+        await bot.send_telegram_report(
             self.hh_login,
             self.resume,
             self.success_applies_num,
@@ -404,21 +412,10 @@ class JobApplier:
 
     def check_the_last_search_time(self) -> bool:
         """
-        Проверяем, чтобы поиск работы запускался не раньше,
-        чем через сутки после предыдущего запуска.
-        Либо проверяем, что последний отклик был меньше часа назад
-        это означает, что приложение принудительно перезапускали.
+        Проверка времени последнего поиска (отключена по просьбе пользователя).
+        Всегда возвращает True.
         """
-        logger.info("Проверяем время запуска предыдущего поиска")
-        if self.cache.get("last_run"):
-            last_run = datetime.fromisoformat(self.cache["last_run"])
-        else:
-            return True
-        if (
-            datetime.now() - last_run
-        ).total_seconds() >= 60 * 60 * 24 or self.previous_apply_number > 0:
-            return True
-        return False
+        return True
 
     def _check_the_previous_apply_number(self) -> bool:
         """
@@ -491,7 +488,7 @@ class JobApplier:
     def _save_company(
         self,
         job: Dict[str, Any],
-        apply_result: Tuple[str, str],
+        apply_result: Tuple[str, str, str],
         vacancy: Dict[str, Any],
     ) -> None:
         """
@@ -503,7 +500,7 @@ class JobApplier:
         company_name = job["company_name"]
         company_job_title = job["job_title"]
 
-        result, reason = apply_result
+        result, reason, _ = apply_result
 
         if result == "Success":
             companies = self.success_companies
@@ -625,9 +622,10 @@ class JobApplier:
 
     def _is_blacklisted(self, company: str) -> bool:
         """Проверить, не находится ли компания в черном списке"""
-        if company in self.job_blacklist:
-            logger.warning("Компания в черном списке, пропускаем")
-            return True
+        for blacklisted in self.job_blacklist:
+            if blacklisted in company:
+                logger.warning(f"Компания '{company}' содержит слово из черного списка '{blacklisted}', пропускаем")
+                return True
         return False
 
     def _is_already_applied_to_job_or_company(self, job: Dict[str, Any]) -> Tuple[bool, str]:
