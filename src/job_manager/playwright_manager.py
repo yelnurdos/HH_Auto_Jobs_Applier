@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import random
 import re
@@ -20,6 +21,14 @@ from src.utils.browser_utils import (
 )
 from src.utils.utils import sanitize_text
 from src.views.resume import Resume
+
+
+class SearchPageError(Exception):
+    """Страница выдачи hh.ru недоступна: ошибка hh.ru, сбой сети или неизвестная разметка."""
+
+
+class SearchSetupError(Exception):
+    """Не удалось применить заданные в search_config.yaml настройки до отправки поиска."""
 
 
 class PlaywrightJobManager:
@@ -291,61 +300,70 @@ class PlaywrightJobManager:
         await asyncio.sleep(random.uniform(low, high))
 
     async def start_search(self, resume_id: str) -> None:
-        """Начинает поиск вакансий для указанного резюме."""
+        """
+        Устаревший вход: страница резюме и рекомендованные вакансии.
+        Текущий поиск не использует (см. `set_advanced_search_params`),
+        метод сохранён для совместимости.
+        """
         url = f"https://hh.ru/resume/{resume_id}"
         await self.page.goto(url)
         logger.info(f"Переход на страницу: {url}")
         await safe_click(self.page, "xpath=//*[contains(text(), 'Подобрали для вас')]")
 
+    # Максимум попыток открытия страницы выдачи при временных сбоях hh.ru
+    SEARCH_PAGE_MAX_ATTEMPTS = 3
+    # Задержка (сек) перед первой повторной попыткой, растёт с каждой попыткой
+    SEARCH_PAGE_RETRY_BASE_DELAY = 3.0
+    # Сколько миллисекунд ждать отрисовки выдачи (карточки или маркер пустой выдачи)
+    SEARCH_RESULTS_WAIT_MS = 20000
+    # Сколько проверок (по 0.5 с) делать после выбора размера страницы
+    PAGE_SIZE_VERIFY_POLLS = 12
+    # Маркеры страницы ошибки hh.ru (ошибка может приходить при HTTP 200)
+    ERROR_PAGE_MARKERS = (
+        "Страница временно недоступна",
+        "Ошибка 502",
+        "Ошибка 503",
+        "Ошибка 504",
+    )
+
     async def set_advanced_search_params(
         self, search_params: Dict[str, Any], resume_id: str
     ) -> None:
         """
-        Заходит на страницу расширенного поиска hh.ru и выставляет настройки из `search_config.yaml`.
+        Открывает поиск вакансий hh.ru и применяет настройки из `search_config.yaml`
+        через панель «Фильтры» на обычной странице выдачи.
+
+        Контракт сохранён: (search_params, resume_id); `resume_id` не используется —
+        поиск больше не идёт через страницу резюме и старый `/advanced`.
 
         `search_params` ожидается в "сыром" виде (как в YAML / `SearchConfig.model_dump()`).
+
+        Поднятые в настройках фильтры применяются явно: если заданный фильтр не
+        поддерживается или не удалось применить, выбрасывается SearchSetupError —
+        расширенный поиск с молча отброшенными условиями не запускается.
         """
         self.search_params = search_params or {}
-        await self.start_search(resume_id)
-        opened = False
-        await self.pause_async(3, 4)
-        for selector in (
-            "[data-qa='advanced-search']",
-            "[aria-label='Расширенный поиск']",
-            "xpath=//*[contains(., 'Расширенный поиск')]",
-        ):
-            if await safe_click(self.page, selector, timeout=10000):
-                opened = True
-                break
+        self.search_page_url = ""
+        self._applied_area_ids: Dict[str, int] = {}
+        logger.info("Задаю параметры поиска в панели «Фильтры» hh.ru")
 
-        if not opened:
-            logger.warning("Advanced search button not found; trying to open advanced search URL")
-            try:
-                await self.page.goto("https://hh.ru/search/vacancy/advanced")
-                logger.info("Переход на страницу: https://hh.ru/search/vacancy/advanced")
-            except Exception as e:
-                logger.error(f"Failed to navigate to advanced search page: {e}")
-                return
-
-        # Wait for advanced-search UI to be present
-        try:
-            await self.page.wait_for_selector(
-                "[data-qa='vacancysearch__keywords-input']", timeout=15000
-            )
-        except Exception:
-            # UI sometimes loads under different qa; keep going best-effort
-            pass
-
+        # 1) Обычная страница выдачи (без /advanced и без страницы резюме)
+        await self._goto_search_url("https://hh.ru/search/vacancy")
         await self._handle_interfering_messages()
 
-        # 2) Apply settings (best-effort for each block)
-        # TODO: добавить частоту выплат, график работы, рабочие часы, категорию прав
+        # 2) Ключевые слова в верхнем поле поиска
         await self._set_keywords()
+
+        # 3) Открыть панель «Фильтры»
+        if not await self._open_filters_panel():
+            raise SearchSetupError("Не удалось открыть панель «Фильтры» на странице выдачи")
+
+        # 4) Применить настройки (остановка поиска при невозможности применить заданный фильтр)
         await self._set_search_field()
+        await self._set_area()
         await self._set_words_to_exclude()
         await self._set_professional_role()
         await self._set_industry()
-        await self._set_area()
         await self._set_districts()
         await self._set_salary_and_currency()
         await self._set_only_with_salary()
@@ -356,17 +374,17 @@ class PlaywrightJobManager:
         await self._set_vacancy_label()
         await self._set_order_by()
         await self._set_period()
+
+        # 5) Подтвердить панель и дождаться обновления выдачи
+        if not await self._apply_filters_panel():
+            raise SearchSetupError("Не найдена кнопка подтверждения панели «Фильтры»")
+        await self._wait_for_search_results()
+        # Проверить фактически применённые условия (потеря ключевых слов/регионов/
+        # флажков — явная ошибка до обработки вакансий); адрес сохраняется только здесь
+        await self._validate_search_applied()
+
+        # 6) Размер выдачи (элемент вне панели)
         await self._set_show()
-        # 3) Handle interfering messages
-        await self._handle_interfering_messages()
-        # 4) Start search
-        if not await safe_click(
-            self.page, "[data-qa='advanced-search-submit-button']", timeout=10000
-        ):
-            await safe_click(
-                self.page, "xpath=//*[text()='Найти' or text()='Найти вакансии']", timeout=10000
-            )
-        await self.pause_async(2, 3)
 
     # -----------------------------
     # Advanced search helpers (UI)
@@ -430,163 +448,736 @@ class PlaywrightJobManager:
         except Exception:
             return False
 
-    async def _set_keywords(self) -> None:
-        """Устанавливает ключевые слова."""
-        logger.debug("Вводим ключевые слова")
-        keywords = self.search_params.get("keywords") or self.search_params.get("text") or ""
-        keywords = str(keywords).strip()
-        if not keywords:
-            return
-        await safe_fill(
-            self.page, "[data-qa='vacancysearch__keywords-input']", keywords, timeout=10000
-        )
-        # await self.pause_async(0.5, 1)
-        # await self.page.keyboard.press("ArrowDown")
-        # await self.pause_async(0.5, 1)
-        # await self.page.keyboard.press("Enter")
-        suggestion_xpath = (
-            "//*[@data-qa='suggest-item-cell' or @data-qa='suggester__keywords-item']"
-        )
-        await self._click_best_suggestion(keywords, f"xpath={suggestion_xpath}")
-        await self.pause_async(0.5, 1)
+    async def _goto_search_url(self, url: str, max_attempts: Optional[int] = None) -> None:
+        """
+        Переходит на адрес страницы выдачи с ограниченным числом повторных попыток.
 
-    async def _set_search_field(self) -> None:
-        """Задает настройки области поиска (в названии вакансии, компании, описании)."""
-        logger.debug("Задаем настройки области поиска")
-        search_field = self.search_params.get("search_field") or {}
-        enabled = set(self._true_keys(search_field))
-        if not enabled:
-            return
-
-        # New HH advanced search uses checkbox inputs: name="search_field", value in {name, company_name, description}
-        # Click by input/label first (more stable than text), then fallback to old text-based clicking.
-        for key in ("name", "company_name", "description"):
-            if key not in enabled:
+        Повторяется при временных сбоях: статусы 5xx, страница ошибки hh.ru
+        (может приходить при HTTP 200), сетевые/навигационные сбои.
+        Бесконечных повторов нет; после исчерпания попыток — SearchPageError.
+        """
+        if not self.page:
+            raise SearchPageError("Браузер не инициализирован")
+        attempts = max_attempts or self.SEARCH_PAGE_MAX_ATTEMPTS
+        last_error: Optional[Exception] = None
+        for attempt in range(1, attempts + 1):
+            try:
+                response = await self.page.goto(url, timeout=60000, wait_until="domcontentloaded")
+            except Exception as e:
+                last_error = SearchPageError(f"Сбой сети/навигации при открытии {url}: {e}")
+                logger.warning(f"Не удалось открыть страницу выдачи (попытка {attempt}/{attempts}): {e}")
+                await asyncio.sleep(self.SEARCH_PAGE_RETRY_BASE_DELAY * attempt)
                 continue
 
-            clicked = await safe_click(
-                self.page,
-                f"xpath=//label[.//input[@name='search_field' and @value='{key}']]",
+            status = response.status if response is not None else None
+            # Даём странице время отрисоваться: ошибка hh.ru может приходить при HTTP 200
+            await self.pause_async(1.5, 2.5)
+            marker = await self._page_error_marker()
+
+            if status is not None and status >= 500:
+                last_error = SearchPageError(f"hh.ru вернул статус {status} для {url}")
+                logger.warning(f"hh.ru вернул статус {status} (попытка {attempt}/{attempts})")
+                await asyncio.sleep(self.SEARCH_PAGE_RETRY_BASE_DELAY * attempt)
+                continue
+            if marker:
+                last_error = SearchPageError(
+                    f"hh.ru показал страницу ошибки (status={status}, маркер «{marker}»): {url}"
+                )
+                logger.warning(
+                    f"Страница ошибки hh.ru: «{marker}» (попытка {attempt}/{attempts})"
+                )
+                await asyncio.sleep(self.SEARCH_PAGE_RETRY_BASE_DELAY * attempt)
+                continue
+            return
+        raise last_error if last_error else SearchPageError(f"Не удалось открыть страницу выдачи: {url}")
+
+    async def _page_error_marker(self) -> Optional[str]:
+        """Возвращает маркер, если текущая страница — страница ошибки hh.ru, иначе None."""
+        try:
+            body_text = await self.page.evaluate(
+                "() => (document.body && document.body.innerText) || ''"
+            )
+        except Exception:
+            return None
+        text = (body_text or "").lower()
+        for marker in self.ERROR_PAGE_MARKERS:
+            if marker.lower() in text:
+                return marker
+        return None
+
+    def _search_url_for_page(self, page_num: int) -> str:
+        """
+        Строит адрес страницы выдачи с номером `page_num` из сохранённого адреса поиска.
+        Все параметры поиска (ключевые слова, регионы и пр.) сохраняются.
+        """
+        if not self.search_page_url:
+            raise SearchPageError(
+                "Адрес поиска не задан — сначала выполните set_advanced_search_params"
+            )
+        parsed = urllib.parse.urlparse(self.search_page_url)
+        if "hh.ru" not in parsed.netloc or "/search/vacancy" not in parsed.path:
+            raise SearchPageError(
+                f"Сохранённый адрес не является поиском вакансий: {self.search_page_url}"
+            )
+        query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+        query["page"] = [str(page_num)]
+        new_query = urllib.parse.urlencode(query, doseq=True)
+        return urllib.parse.urlunparse(parsed._replace(query=new_query))
+
+    async def _robust_click(self, locator: Locator, what: str = "", timeout: int = 5000) -> bool:
+        """
+        Клик по первому элементу locator. Fallback: force-клик, затем JS-клик
+        (панели hh.ru — overlay, обычный клик может перехватываться оверлеем).
+        """
+        try:
+            await locator.first.click(timeout=timeout)
+            return True
+        except Exception:
+            pass
+        try:
+            await locator.first.click(timeout=timeout, force=True)
+            return True
+        except Exception:
+            pass
+        try:
+            await locator.first.evaluate("el => el.click()")
+            return True
+        except Exception as e:
+            logger.warning(f"Не удалось кликнуть {what or 'элемент'}: {e}")
+            return False
+
+    async def _open_filters_panel(self) -> bool:
+        """
+        Открывает панель «Фильтры» на странице выдачи и ждёт её появления.
+
+        Важно: на живом hh.ru data-qa="catalog-search-extra-filters" может стоять
+        на обёртке блока «Быстрые фильтры», а не на кнопке — клик по div не бросает
+        исключения, но панель не открывается. Поэтому ищем реальный <button> с
+        подписью «Фильтры», эскалируем способ клика (обычный → force → JS) и после
+        каждого клика проверяем, что панель действительно открылась.
+        """
+        # Дожимаем отрисовку выдачи перед открытием панели (страница может
+        # перерисовываться после запуска поиска)
+        try:
+            await self.page.wait_for_selector(
+                '[data-qa="vacancy-serp__vacancy"], [data-qa="empty-vacancy-search-block"]',
+                timeout=8000,
+            )
+        except Exception:
+            logger.warning("Выдача не отрисовалась до открытия панели «Фильтры» — продолжаю")
+
+        # Реальная кнопка «Фильтры»: <button> с вложенной подписью, иначе span с текстом
+        button = self.page.locator(
+            "xpath=//button[.//*[normalize-space(text())='Фильтры']]"
+        ).first
+        if await button.count() == 0:
+            button = self.page.get_by_text("Фильтры", exact=True).first
+        if await button.count() == 0:
+            logger.error("Кнопка «Фильтры» не найдена")
+            return False
+
+        for mode in ("normal", "force", "js"):
+            try:
+                if mode == "normal":
+                    await button.click(timeout=6000)
+                elif mode == "force":
+                    await button.click(timeout=6000, force=True)
+                else:
+                    await button.evaluate("el => el.click()")
+            except Exception as e:
+                logger.debug(f"Клик {mode} по «Фильтры» не удался: {str(e)[:120]}")
+                continue
+            try:
+                await self.page.wait_for_selector(
+                    "[data-qa='search-drawer-filters-submit']", timeout=8000
+                )
+                return True
+            except Exception:
+                logger.debug(f"Панель не открылась после клика {mode}, пробую следующий способ")
+                continue
+        logger.error("Панель «Фильтры» не открылась (не появилось поле подтверждения)")
+        return False
+
+    async def _apply_filters_panel(self) -> bool:
+        """Нажимает кнопку подтверждения панели «Фильтры»."""
+        submit = self.page.locator("[data-qa='search-drawer-filters-submit']")
+        if await submit.count() == 0:
+            return False
+        return await self._robust_click(submit, what="подтверждение фильтров", timeout=8000)
+
+    async def _wait_for_search_results(self) -> None:
+        """
+        Ждёт закрытия панели и обновления выдачи.
+
+        Если после применения фильтров hh.ru показал страницу ошибки (5xx или
+        маркер ошибки при HTTP 200), повторяет тот же запрос с уже выбранными
+        условиями (не повторяет клики по флажкам, не возвращается на поиск без
+        параметров): всего до SEARCH_PAGE_MAX_ATTEMPTS попыток, включая исходный
+        переход.
+
+        Финальный адрес сохраняет `_validate_search_applied` — только после
+        проверки применённых условий.
+        """
+        # Ждём закрытия панели (до ~15 сек)
+        for _ in range(30):
+            submit = self.page.locator("[data-qa='search-drawer-filters-submit']")
+            try:
+                if await submit.count() == 0 or not await submit.first.is_visible():
+                    break
+            except Exception:
+                break
+            await asyncio.sleep(0.5)
+
+        # Ждём полного закрытия модалки: анимация закрытия может перехватывать клики
+        try:
+            await self.page.wait_for_selector(
+                "[data-qa='search-filters']", state="hidden", timeout=10000
+            )
+        except Exception:
+            pass
+        await self.pause_async(0.5, 1)
+
+        # Повторяемый переход: адрес уже содержит выбранные условия
+        url = self.page.url
+        attempts = self.SEARCH_PAGE_MAX_ATTEMPTS
+        marker: Optional[str] = None
+        for attempt in range(1, attempts + 1):
+            # Ждём появления карточек или явного маркера пустой выдачи
+            try:
+                await self.page.wait_for_selector(
+                    '[data-qa="vacancy-serp__vacancy"], [data-qa="empty-vacancy-search-block"]',
+                    timeout=self.SEARCH_RESULTS_WAIT_MS,
+                )
+            except Exception:
+                logger.warning("Выдача не отрисовалась после применения фильтров")
+            await self.pause_async(0.5, 1)
+            marker = await self._page_error_marker()
+            if not marker:
+                break
+            logger.warning(
+                f"hh.ru показал страницу ошибки после применения фильтров "
+                f"(попытка {attempt}/{attempts})"
+            )
+            if attempt >= attempts:
+                break
+            await asyncio.sleep(self.SEARCH_PAGE_RETRY_BASE_DELAY * attempt)
+            try:
+                response = await self.page.goto(url, timeout=60000, wait_until="domcontentloaded")
+            except Exception as e:
+                logger.warning(
+                    f"Сбой повторного перехода на адрес выдачи "
+                    f"(попытка {attempt + 1}/{attempts}): {e}"
+                )
+                continue
+            if response is not None and response.status >= 500:
+                logger.warning(
+                    f"hh.ru вернул статус {response.status} при повторе "
+                    f"(попытка {attempt + 1}/{attempts})"
+                )
+        if marker:
+            raise SearchPageError(
+                f"hh.ru вернул страницу ошибки после применения фильтров: «{marker}»"
+            )
+        logger.info(f"Поиск применён, адрес после панели: {self.page.url}")
+
+    async def _read_panel_filter_states(self) -> Dict[str, bool]:
+        """
+        Переоткрывает панель «Фильтры» и читает наблюдаемое состояние чекбоксов
+        (области поиска, «только с зарплатой»). Используется для параметров,
+        которых нет в адресе выдачи: источник истины — состояние интерфейса,
+        не предположение.
+        """
+        if not await self._open_filters_panel():
+            raise SearchSetupError(
+                "Не удалось открыть панель «Фильтры» для проверки поисковых условий"
+            )
+        states: Dict[str, bool] = {}
+        for key in ("name", "company_name", "description"):
+            locator = self.page.locator(f"[data-qa='search-filter-search_field-value-{key}']")
+            if await locator.count() == 0:
+                raise SearchSetupError(
+                    f"Не найден чекбокс области поиска '{key}' в панели «Фильтры»"
+                )
+            try:
+                states[key] = await locator.first.is_checked()
+            except Exception as e:
+                # Сбой чтения не выдаём за прочитанное «выключено»
+                raise SearchSetupError(f"Не удалось прочитать чекбокс '{key}' в панели: {e}")
+        salary = self.page.locator("[data-qa='search-filter-value-with_salary']")
+        if await salary.count() == 0:
+            raise SearchSetupError("Не найден чекбокс «только с зарплатой» в панели «Фильтры»")
+        try:
+            states["with_salary"] = await salary.first.is_checked()
+        except Exception as e:
+            raise SearchSetupError(f"Не удалось прочитать чекбокс «только с зарплатой»: {e}")
+        # Закрываем панель без подтверждения
+        close = self.page.locator("[data-qa='search-filters-close']")
+        if await close.count():
+            await self._robust_click(close, what="закрытие панели «Фильтры»", timeout=5000)
+        try:
+            await self.page.keyboard.press("Escape")
+        except Exception:
+            pass
+        try:
+            await self.page.wait_for_selector(
+                "[data-qa='search-drawer-filters-submit']", state="hidden", timeout=10000
+            )
+        except Exception:
+            logger.warning("Панель «Фильтры» не закрылась после проверки условий")
+        return states
+
+    async def _validate_search_applied(self) -> None:
+        """
+        После отправки панели (и после смены размера выдачи) сверяет фактически
+        применённые условия: адрес выдачи, а для параметров, отсутствующих в
+        адресе — наблюдаемое состояние чекбоксов панели.
+
+        Потеря ключевых слов, регионов или заданных флажков — SearchSetupError
+        до обработки вакансий. Адрес сохраняется как рабочий только после
+        успешной проверки.
+        """
+        url = self.page.url
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+        problems: List[str] = []
+
+        # Ключевые слова: применённый запрос — параметр text в адресе выдачи.
+        # Значение в верхнем поле не доказывает применение: поле может
+        # сохранять введённый текст при пустом/чужом запросе.
+        keywords = str(
+            self.search_params.get("keywords") or self.search_params.get("text") or ""
+        ).strip()
+        if keywords:
+            url_text = (query.get("text") or [""])[0]
+            if url_text != keywords:
+                problems.append(
+                    f"ключевые слова '{keywords}' не применены: в адресе '{url_text}'"
+                )
+
+        # Регионы: каждый запрошенный регион должен иметь подтверждённый id,
+        # и этот id должен быть в адресе (неполный словарь — не успех)
+        url_areas = query.get("area", [])
+        for region in self._split_multi(self.search_params.get("area")):
+            if not region:
+                continue
+            area_id = (getattr(self, "_applied_area_ids", {}) or {}).get(region)
+            if area_id is None:
+                problems.append(f"регион '{region}': нет подтверждённого id, проверить нельзя")
+            elif str(area_id) not in url_areas:
+                problems.append(f"регион '{region}' (id {area_id}) потерялся из адреса")
+
+        # Область поиска: заданные true значения — в адресе или в панели
+        search_field = self.search_params.get("search_field")
+        panel_states: Optional[Dict[str, bool]] = None
+        if isinstance(search_field, dict):
+            url_sf = query.get("search_field", [])
+            missing = [
+                key
+                for key in ("name", "company_name", "description")
+                if search_field.get(key) is True and key not in url_sf
+            ]
+            if missing:
+                panel_states = await self._read_panel_filter_states()
+                for key in missing:
+                    if not panel_states.get(key):
+                        problems.append(f"область поиска '{key}' не применена")
+
+        # «Только с зарплатой»: включено — должно быть в адресе (или в панели),
+        # выключено — не должно быть в адресе
+        only_with_salary = self.search_params.get("only_with_salary")
+        url_salary = (query.get("with_salary") or [""])[0].lower() in ("true", "1")
+        if only_with_salary is True:
+            if not url_salary:
+                if panel_states is None:
+                    panel_states = await self._read_panel_filter_states()
+                if not panel_states.get("with_salary"):
+                    problems.append("«только с зарплатой» включено в настройках, но не применено")
+        elif only_with_salary is False and url_salary:
+            problems.append("only_with_salary=False, но в адресе with_salary=true")
+
+        if problems:
+            raise SearchSetupError("Поисковые условия не применены полностью: " + "; ".join(problems))
+        self.search_page_url = url
+
+    async def _set_keywords(self) -> None:
+        """Вводит ключевые слова в верхнее поле поиска и проверяет фактическое значение."""
+        logger.debug("Вводим ключевые слова")
+        keywords = str(self.search_params.get("keywords") or self.search_params.get("text") or "").strip()
+        if not keywords:
+            return
+        selector = "[data-qa='search-input']"
+        if await self.page.locator(selector).count() == 0:
+            raise SearchSetupError("Не найдено верхнее поле поиска вакансий (search-input)")
+        await self._robust_click(self.page.locator(selector), what="поле поиска", timeout=8000)
+        await self.pause_async(0.5, 1)
+        if not await safe_fill(self.page, selector, keywords, timeout=10000):
+            raise SearchSetupError(f"Не удалось ввести ключевые слова: '{keywords}'")
+        actual = await self.page.locator(selector).first.input_value()
+        if (actual or "").strip() != keywords:
+            raise SearchSetupError(
+                f"Ключевые слова не применились: ожидалось '{keywords}', в поле '{(actual or '').strip()}'"
+            )
+        # Запускаем поиск и ждём обновления адреса. Обновление адреса НЕ доказывает
+        # успех: hh.ru может вернуть страницу ошибки (5xx или маркер при HTTP 200)
+        # по тому же адресу с правильным text. Маркер ошибки проверяется до
+        # признания перехода успешным; при ошибке — повтор того же запроса
+        # (прямой адрес с ключевыми словами), всего до SEARCH_PAGE_MAX_ATTEMPTS
+        # попыток, включая исходный переход.
+        await self.page.keyboard.press("Enter")
+        attempts = self.SEARCH_PAGE_MAX_ATTEMPTS
+        url_ok = False
+        for attempt in range(1, attempts + 1):
+            try:
+                await self.page.wait_for_function(
+                    "expected => new URLSearchParams(location.search).get('text') === expected",
+                    arg=keywords,
+                    timeout=15000,
+                )
+                url_ok = True
+            except Exception:
+                url_ok = False
+            marker = await self._page_error_marker()
+            if not marker:
+                break  # страницы ошибки нет — успех либо адрес просто не обновился
+            logger.warning(
+                f"hh.ru показал страницу ошибки после запуска поиска (попытка {attempt}/{attempts})"
+            )
+            if attempt >= attempts:
+                break
+            await asyncio.sleep(self.SEARCH_PAGE_RETRY_BASE_DELAY * attempt)
+            try:
+                response = await self.page.goto(
+                    f"https://hh.ru/search/vacancy?text={urllib.parse.quote(keywords)}",
+                    timeout=60000,
+                    wait_until="domcontentloaded",
+                )
+            except Exception as e:
+                logger.warning(f"Сбой повторного перехода с ключевыми словами: {e}")
+                continue
+            if response is not None and response.status >= 500:
+                logger.warning(
+                    f"hh.ru вернул статус {response.status} при запуске поиска "
+                    f"(попытка {attempt + 1}/{attempts})"
+                )
+                continue
+        # После цикла: страница ошибки — явная ошибка, не успех
+        marker = await self._page_error_marker()
+        if marker:
+            raise SearchPageError(
+                f"hh.ru вернул страницу ошибки после запуска поиска: «{marker}»"
+            )
+        if url_ok:
+            logger.info(f"Поиск запущен по ключевым словам: '{keywords}'")
+        else:
+            actual = (await self.page.locator(selector).first.input_value() or "").strip()
+            if actual != keywords:
+                raise SearchSetupError(
+                    f"Ключевые слова не применились: ожидалось '{keywords}', в поле '{actual}'"
+                )
+            logger.warning(
+                "Адрес выдачи не обновился с ключевыми словами, значение в поле совпадает — продолжаю"
+            )
+
+    async def _set_search_field(self) -> None:
+        """
+        Область поиска: доводит чекбоксы search-filter-search_field-value-* до нужного
+        состояния (явные false выключаются, true включаются) и проверяет результат.
+        """
+        logger.debug("Задаем настройки области поиска")
+        search_field = self.search_params.get("search_field")
+        if not isinstance(search_field, dict) or not search_field:
+            return
+        for key in ("name", "company_name", "description"):
+            if key not in search_field:
+                continue
+            desired = bool(search_field.get(key))
+            selector = f"[data-qa='search-filter-search_field-value-{key}']"
+            locator = self.page.locator(selector)
+            if await locator.count() == 0:
+                raise SearchSetupError(f"Не найден элемент области поиска '{key}'")
+            try:
+                current = await locator.first.is_checked()
+            except Exception:
+                current = None
+            if current is not None and current != desired:
+                if not await self._robust_click(locator, what=f"область поиска '{key}'", timeout=5000):
+                    raise SearchSetupError(f"Не удалось переключить область поиска '{key}'")
+                await self.pause_async(0.3, 0.7)
+        # Проверка фактического состояния
+        for key in ("name", "company_name", "description"):
+            if key not in search_field:
+                continue
+            desired = bool(search_field.get(key))
+            current = await self.page.locator(
+                f"[data-qa='search-filter-search_field-value-{key}']"
+            ).first.is_checked()
+            if current != desired:
+                raise SearchSetupError(
+                    f"Область поиска '{key}' не применилась: состояние {current}, ожидалось {desired}"
+                )
+
+    async def _read_option_id(self, element, text: str = "") -> Optional[int]:
+        """Читает числовой id выбранной опции: data-qa `magritte-select-option-<id>`
+        либо атрибут data-magritte-select-option (оба встречаются на живом hh.ru).
+        Если элемент — контейнер списка (magritte-select-option-list), ищет id
+        у вложенной опции с точно таким же текстом; неоднозначность — None
+        (неверный id опаснее отсутствия id)."""
+        try:
+            handle = await element.first.element_handle()
+        except Exception:
+            return None
+        if handle is None:
+            return None
+        try:
+            return await handle.evaluate(
+                """(el, text) => {
+                    const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                    const fromEl = (n) => {
+                        if (!n || !n.getAttribute) return null;
+                        const qa = n.getAttribute('data-qa') || '';
+                        const m = qa.match(/magritte-select-option-(\\d+)/);
+                        if (m) return parseInt(m[1], 10);
+                        const raw = n.getAttribute('data-magritte-select-option') || '';
+                        if (/^\\d+$/.test(raw)) return parseInt(raw, 10);
+                        return null;
+                    };
+                    const id = fromEl(el);
+                    if (id !== null) return id;
+                    const wanted = norm(text);
+                    if (!wanted) return null;
+                    const inner = el.querySelectorAll(
+                        "[data-qa^='magritte-select-option-'], [data-magritte-select-option]"
+                    );
+                    let found = null;
+                    for (const o of inner) {
+                        const oid = fromEl(o);
+                        if (oid === null) continue;
+                        if (norm(o.textContent) === wanted) {
+                            if (found === null) found = oid;
+                            else return null; // несколько опций с таким текстом
+                        }
+                    }
+                    return found;
+                }""",
+                text,
+            )
+        except Exception:
+            return None
+
+    async def _pick_from_chips_block(self, block_selector: str, value: str) -> bool:
+        """
+        В chips-блоке (регионы, исключаемые слова и т.п.) выбирает значение по подсказкам:
+        вводит текст, ждёт список подсказок, кликает по ближайшему подходящему варианту
+        и проверяет, что значение появилось в блоке.
+
+        При успехе записывает числовой id выбранного варианта (data-qa
+        magritte-select-option-<id>) в self._last_picked_option_id — для регионов
+        используется в проверке применённых условий.
+        """
+        self._last_picked_option_id = None
+        block = self.page.locator(block_selector)
+        if await block.count() == 0:
+            return False
+        input_selector = f"{block_selector} [data-qa='chips-trigger-input']"
+        input_locator = self.page.locator(input_selector)
+        if await input_locator.count() == 0:
+            return False
+        # Фокус на поле (обычный клик может перехватываться оверлеем панели)
+        try:
+            await input_locator.first.click(timeout=3000)
+        except Exception:
+            try:
+                await input_locator.first.evaluate("el => el.focus()")
+            except Exception:
+                return False
+        await self.pause_async(0.3, 0.7)
+        if not await safe_fill(self.page, input_selector, value, timeout=10000):
+            return False
+
+        options = self.page.locator("[data-qa^='magritte-select-option-']")
+        # Ждём, пока подсказки обновятся под введённый текст. После предыдущего
+        # выбора в DOM могут оставаться старые видимые опции (например «Астана»),
+        # и простой wait_for(state="visible") мгновенно срабатывает на них.
+        desired_q = value.strip().lower()
+        try:
+            await self.page.wait_for_function(
+                """(desired) => {
+                    const opts = document.querySelectorAll("[data-qa^='magritte-select-option-']");
+                    for (const el of opts) {
+                        // контейнер списка — не опция (содержит весь текст опций)
+                        if (el.getAttribute && el.getAttribute('data-qa') === 'magritte-select-option-list') continue;
+                        const r = el.getBoundingClientRect();
+                        if (r.width === 0 || r.height === 0) continue;
+                        const style = window.getComputedStyle(el);
+                        if (style.display === 'none' || style.visibility === 'hidden') continue;
+                        const t = (el.textContent || '').trim().toLowerCase();
+                        if (t.startsWith(desired)) return true;
+                    }
+                    return false;
+                }""",
+                arg=desired_q,
                 timeout=10000,
             )
-            if not clicked:
-                # Old selenium-era fallback: click by visible text
-                text_map = {
-                    "name": "в названии вакансии",
-                    "company_name": "в названии компании",
-                    "description": "в описании вакансии",
-                }
-                await safe_click(
-                    self.page,
-                    f"xpath=//*[self::label or self::span or self::div][contains(., '{text_map[key]}')]",
-                    timeout=10000,
-                )
-            await self.pause_async(0.5, 1)
+        except Exception:
+            logger.warning(
+                f"Подсказки под «{value}» не появились за 10 секунд — проверю, что есть в списке"
+            )
+
+        items: List[Tuple[int, str]] = []
+        for i in range(await options.count()):
+            option = options.nth(i)
+            try:
+                if not await option.is_visible():
+                    continue
+            except Exception:
+                continue
+            # Контейнер списка опций (data-qa magritte-select-option-list) тоже
+            # попадает в префикс-селектор и содержит весь текст опций —
+            # это не выбираемый элемент, его пропускаем
+            try:
+                if (await option.get_attribute("data-qa")) == "magritte-select-option-list":
+                    continue
+            except Exception:
+                pass
+            text = re.sub(r"\s+", " ", (await option.text_content() or "")).strip()
+            if text:
+                items.append((i, text))
+        if not items:
+            return False
+
+        desired = value.strip().lower()
+        best_idx, best_text = None, None
+        for i, text in items:
+            if text.lower().startswith(desired):
+                best_idx, best_text = i, text
+                break
+        if best_idx is None:
+            best_idx, best_text = min(items, key=lambda item: distance(desired, item[1].lower()))
+
+        # Не берём явно нерелевантную подсказку
+        if distance(desired, best_text.lower()) > max(3, len(desired) // 2):
+            logger.warning(
+                f"Среди подсказок нет подходящего варианта для '{value}' (ближайший: '{best_text}')"
+            )
+            return False
+
+        clicked = options.nth(best_idx)
+        # id выбранного варианта (для регионов: сверка с адресом выдачи).
+        # Читается ДО клика: Locator заново ищет элемент при каждом обращении,
+        # а после клика список подсказок может очищаться/перерисовываться,
+        # и тот же индекс укажет на другой элемент (например, опцию размера
+        # страницы). Живой data-qa может иметь суффикс после id — якорь не ставим;
+        # резервный источник id — атрибут data-magritte-select-option.
+        try:
+            self._last_picked_option_id = await self._read_option_id(clicked, best_text)
+        except Exception:
+            self._last_picked_option_id = None
+
+        if not await self._robust_click(clicked, what=f"подсказка '{best_text}'", timeout=5000):
+            return False
+        await self.pause_async(0.5, 1)
+
+        block_text = re.sub(r"\s+", " ", (await block.first.text_content()) or "").lower()
+        if desired not in block_text:
+            logger.warning(f"Выбранное значение '{best_text}' не появилось в блоке {block_selector}")
+            return False
+        logger.info(f"Применено: '{value}' -> '{best_text}'")
+        return True
 
     async def _set_words_to_exclude(self) -> None:
         """Задает слова для исключения."""
         logger.debug("Задаем слова для исключения")
-        words = self.search_params.get("words_to_exclude") or ""
-        words = str(words).strip()
+        words = str(self.search_params.get("words_to_exclude") or "").strip()
         if not words:
             return
-        await safe_fill(
-            self.page, "[data-qa='vacancysearch__keywords-excluded-input']", words, timeout=10000
-        )
-        await self.pause_async(0.5, 1)
+        block_selector = "[data-qa='filter-select-excluded_text']"
+        if not await self._pick_from_chips_block(block_selector, words):
+            raise SearchSetupError(f"Не удалось применить исключённые слова: '{words}'")
 
-    async def _set_tree_selector_single(self, open_text: str, value: str) -> None:
+    async def _set_tree_selector_single(self, trigger_qa: str, label: str, value: str) -> None:
         """
-        Выбирает одно значение в модальном окне с древовидным селектором (специализация/отрасль).
-        Открывает модалку, вводит значение, выбирает лучшее совпадение, подтверждает.
+        Выбирает значение в модальном окне tree-selector (специализация/отрасль):
+        открывает модалку по триггеру панели, вводит значение, выбирает ближайшее
+        совпадение из подсказок и подтверждает.
         """
         value = str(value or "").strip()
         if not value:
             return
 
-        # Open modal
-        opened = False
-        for selector in (
-            f"xpath=//*[normalize-space()='{open_text}']",
-            f"xpath=//*[contains(., '{open_text}')]",
-        ):
-            if await safe_click(self.page, selector, timeout=10000):
-                opened = True
-                break
-        if not opened:
-            return
+        trigger = self.page.locator(f"[data-qa='{trigger_qa}']")
+        if await trigger.count() == 0:
+            raise SearchSetupError(f"Не найден триггер фильтра «{label}» ({trigger_qa})")
+        if not await self._robust_click(trigger, what=f"триггер «{label}»", timeout=8000):
+            raise SearchSetupError(f"Не удалось открыть окно «{label}»")
+        await self.pause_async(0.7, 1.2)
 
-        await self.pause_async(0.5, 1)
         search_input_xpath = "//*[@data-qa='tree-selector-search-input' or @data-qa='bloko-tree-selector-popup-search']"
-        await safe_fill(self.page, f"xpath={search_input_xpath}", value, timeout=10000)
+        if not await safe_fill(self.page, f"xpath={search_input_xpath}", value, timeout=10000):
+            raise SearchSetupError(f"Не удалось ввести значение в окне «{label}»")
         await self.pause_async(1, 2)
 
-        # Suggestions inside modal
+        # Подсказки внутри модалки
         suggestion_xpath = (
             "//*[starts-with(@data-qa, 'tree-selector-item') "
             "or starts-with(@data-qa, 'bloko-tree-selector-item-text') "
             "or @data-qa='suggest-item-cell']"
         )
-
-        picked = await self._click_best_suggestion(value, f"xpath={suggestion_xpath}")
-        if not picked:
-            # close/cancel modal if nothing found
+        if not await self._click_best_suggestion(value, f"xpath={suggestion_xpath}"):
+            # Закрываем окно, чтобы панель не осталась с незавершённым выбором
             await safe_click(
                 self.page,
                 "xpath=//*[@data-qa='composite-selection-tree-selector-modal-cancel' or @data-qa='bloko-tree-selector-popup-cancel']",
                 timeout=3000,
             )
-            return
-
+            raise SearchSetupError(f"Не найдена подсказка для «{label}»: '{value}'")
         await self.pause_async(0.5, 1)
-        await safe_click(
+        if not await safe_click(
             self.page,
             "xpath=//*[@data-qa='composite-selection-tree-selector-modal-submit' or @data-qa='bloko-tree-selector-popup-submit']",
             timeout=10000,
-        )
+        ):
+            raise SearchSetupError(f"Не удалось подтвердить выбор в окне «{label}»")
         await self.pause_async(0.5, 1)
 
     async def _set_professional_role(self) -> None:
         """Задает профессиональную роль."""
         logger.debug("Задаем профессиональную роль")
-        value = self.search_params.get("professional_role") or ""
-        value = str(value).strip()
-        if not value:
-            return
-        await self._set_tree_selector_single("Указать специализации", value)
+        await self._set_tree_selector_single(
+            "search-filter-professional-role-trigger",
+            "Указать специализации",
+            str(self.search_params.get("professional_role") or ""),
+        )
 
     async def _set_industry(self) -> None:
         """Задает отрасль."""
         logger.debug("Задаем отрасль")
-        value = self.search_params.get("industry") or ""
-        value = str(value).strip()
-        if not value:
-            return
-        await self._set_tree_selector_single("Указать отрасль компании", value)
+        await self._set_tree_selector_single(
+            "search-filter-industry-trigger",
+            "Указать отрасль компании",
+            str(self.search_params.get("industry") or ""),
+        )
 
     async def _set_area(self) -> None:
-        """Задает регион."""
+        """Выбирает регионы из настроек в поле «Регион» панели фильтров."""
         logger.debug("Задаем регион")
         values = self._split_multi(self.search_params.get("area"))
         if not values:
             return
-
-        input_selector = "[data-qa='advanced-search-region-add'] input"
-        # Some HH versions use a custom input without <input>
-        if await self.page.locator(input_selector).count() == 0:
-            input_selector = "[data-qa='advanced-search-region-add']"
-
-        suggestion_xpath = (
-            "//*[@data-qa='suggest-item-cell' or @data-qa='suggester__keywords-item']"
-        )
+        block_selector = "[data-qa='filter-select-area']"
+        if await self.page.locator(block_selector).count() == 0:
+            raise SearchSetupError("Не найден блок выбора регионов (filter-select-area)")
         for region in values:
             if not region:
                 continue
-            if not await safe_fill(self.page, input_selector, region, timeout=10000):
-                await safe_click(self.page, input_selector, timeout=10000)
-                await self.page.keyboard.type(region)
-            await self.pause_async(0.7, 1)
-            await self._click_best_suggestion(region, f"xpath={suggestion_xpath}")
+            if not await self._pick_from_chips_block(block_selector, region):
+                raise SearchSetupError(f"Не удалось применить регион: '{region}'")
+            # Id выбранного региона обязателен: без него невозможно подтвердить
+            # применение условия после submit (неполный словарь — не успех)
+            if self._last_picked_option_id is None:
+                raise SearchSetupError(
+                    f"Не удалось определить id выбранного региона: '{region}' — "
+                    f"применённые условия не могут быть подтверждены"
+                )
+            self._applied_area_ids[region] = self._last_picked_option_id
 
     async def _set_districts(self) -> None:
         """Задает районы."""
@@ -594,32 +1185,21 @@ class PlaywrightJobManager:
         values = self._split_multi(self.search_params.get("districts"))
         if not values:
             return
-        input_selector = "[data-qa='searchform__district-input']"
-        if await self.page.locator(input_selector).count() == 0:
-            return
-
-        suggestion_xpath = (
-            "//*[@data-qa='suggest-item-cell' or @data-qa='address-edit-district-suggest-item']"
+        raise SearchSetupError(
+            "Районы (districts) не поддерживаются текущим интерфейсом hh.ru — "
+            "уберите districts из search_config.yaml"
         )
-        for district in values:
-            if not district:
-                continue
-            await safe_fill(self.page, input_selector, district, timeout=10000)
-            await self.pause_async(0.7, 1)
-            await self._click_best_suggestion(district, f"xpath={suggestion_xpath}")
 
     async def _set_salary_and_currency(self) -> None:
         """Задает зарплату и валюту."""
         logger.debug("Задаем зарплату и валюту")
         salary = self.search_params.get("salary")
         if salary is not None and salary != "":
-            try:
-                salary_val = str(int(salary))
-            except Exception:
-                salary_val = str(salary)
-            await safe_fill(
-                self.page, "[data-qa='advanced-search-salary']", salary_val, timeout=10000
-            )
+            salary_val = str(int(salary)) if str(salary).strip().isdigit() else str(salary)
+            if not await safe_fill(
+                self.page, "[data-qa='search-filter-compensation-input']", salary_val, timeout=10000
+            ):
+                raise SearchSetupError("Не удалось задать зарплату (search-filter-compensation-input)")
             await self.pause_async(0.5, 1)
 
         currency = self.search_params.get("currency") or {}
@@ -627,65 +1207,93 @@ class PlaywrightJobManager:
         if not currency_key:
             return
 
-        # New HH UI uses "chips" with radio inputs: name="currency_code", data-qa="currency-code-RUR|EUR|USD"
-        # Prefer clicking the label that contains the radio input (inputs may be visually hidden).
-        clicked = await safe_click(
-            self.page,
-            f"xpath=//label[.//input[@name='currency_code' and (@value='{currency_key}' or @data-qa='currency-code-{currency_key}')]]",
-            timeout=3000,
-        )
-        if clicked:
-            await self.pause_async(0.5, 1)
-            return
+        picker = self.page.locator("[data-qa='search-filter-currency-picker']")
+        if await picker.count() == 0:
+            raise SearchSetupError("Не найден элемент выбора валюты (search-filter-currency-picker)")
+        if not await self._robust_click(picker, what="выбор валюты", timeout=5000):
+            raise SearchSetupError("Не удалось открыть выбор валюты")
+        await self.pause_async(0.5, 1)
 
-        # Fallback: some older versions use a <select> or different container
-        select_locator = self.page.locator(
-            "select[name='currency'], [data-qa='advanced-search-currency'] select"
-        )
-        if await select_locator.count() > 0:
+        aliases = {
+            "RUR": ("rub", "₽", "rur"),
+            "USD": ("usd", "$"),
+            "EUR": ("eur", "€"),
+        }
+        options = self.page.locator("[data-qa^='magritte-select-option-']")
+        picked = False
+        for i in range(await options.count()):
+            option = options.nth(i)
             try:
-                await select_locator.first.select_option(currency_key)
-                await self.pause_async(0.5, 1)
-                return
+                if not await option.is_visible():
+                    continue
             except Exception:
-                pass
-
-        text_map = {"RUR": "руб", "USD": "USD", "EUR": "EUR"}
-        await safe_click(
-            self.page,
-            f"xpath=//*[self::label or self::span or self::div][contains(translate(., 'РУБUSDЕUR', 'рубusdеur'), '{text_map.get(currency_key, currency_key).lower()}')]",
-            timeout=2000,
-        )
+                continue
+            text = re.sub(r"\s+", " ", (await option.text_content() or "")).lower()
+            if any(alias in text for alias in aliases.get(currency_key, (currency_key.lower(),))):
+                if await self._robust_click(options.nth(i), what=f"валюта {currency_key}"):
+                    picked = True
+                    break
+        if not picked:
+            raise SearchSetupError(f"Не удалось выбрать валюту: {currency_key}")
+        await self.pause_async(0.5, 1)
 
     async def _set_only_with_salary(self) -> None:
-        """Задает фильтр только с зарплатой."""
+        """
+        Задает фильтр «только с зарплатой» в требуемое состояние
+        (явный false выключает, true включает) и проверяет результат.
+        """
         logger.debug("Задаем фильтр только с зарплатой")
         only = self.search_params.get("only_with_salary")
-        if only is not True:
+        if only is None:
             return
-        # New HH UI: checkbox is input name="label" value="with_salary"
-        if await safe_click(
-            self.page,
-            "xpath=//label[.//input[@name='label' and @value='with_salary']]",
-            timeout=3000,
-        ):
-            await self.pause_async(0.5, 1)
+        desired = bool(only)
+        locator = self.page.locator("[data-qa='search-filter-value-with_salary']")
+        if await locator.count() == 0:
+            if desired:
+                raise SearchSetupError("Не найден фильтр «только с зарплатой»")
+            logger.info("Элемент «только с зарплатой» не найден, требуемое состояние false — пропускаю")
             return
+        try:
+            current = await locator.first.is_checked()
+        except Exception:
+            current = None
+        if current is not None and current != desired:
+            if not await self._robust_click(locator, what="«только с зарплатой»", timeout=5000):
+                raise SearchSetupError("Не удалось переключить фильтр «только с зарплатой»")
+            await self.pause_async(0.3, 0.7)
+        if desired:
+            if not await locator.first.is_checked():
+                raise SearchSetupError("Фильтр «только с зарплатой» не применился")
 
-        # Fallback: click by likely text (older versions)
-        for t in (
-            "Только с зарплатой",
-            "Только с указанной зарплатой",
-            "Только с указанием зарплаты",
-            "Показывать только вакансии",
-        ):
-            if await safe_click(
-                self.page,
-                f"xpath=//*[self::label or self::span or self::div][contains(., '{t}')]",
-                timeout=2000,
-            ):
-                await self.pause_async(0.5, 1)
-                return
+    async def _set_filter_group(
+        self, group: str, states: Dict[str, Any], key_map: Optional[Dict[str, str]] = None
+    ) -> None:
+        """
+        Доводит чекбоксы `search-filter-{group}-value-*` до состояний из настроек:
+        явное false выключает (если включено), true включает.
+        True без найденного элемента — ошибка.
+        """
+        if not isinstance(states, dict) or not states:
+            return
+        for key, raw_value in states.items():
+            suffix = (key_map or {}).get(key, key)
+            if not suffix:
+                continue
+            desired = raw_value is True
+            locator = self.page.locator(f"[data-qa='search-filter-{group}-value-{suffix}']")
+            if await locator.count() == 0:
+                if desired:
+                    raise SearchSetupError(f"Не найден элемент фильтра '{group}': '{key}'")
+                logger.debug(f"Элемент '{group}': '{key}' не найден (значение false), пропускаю")
+                continue
+            try:
+                current = await locator.first.is_checked()
+            except Exception:
+                current = None
+            if current is not None and current != desired:
+                if not await self._robust_click(locator, what=f"{group}:{key}", timeout=5000):
+                    raise SearchSetupError(f"Не удалось переключить фильтр '{group}': '{key}'")
+                await self.pause_async(0.3, 0.7)
 
     async def _set_education(self) -> None:
         """Задает образование."""
@@ -696,90 +1304,46 @@ class PlaywrightJobManager:
             "middle": "special_secondary",
             "higher": "higher",
         }
-        for key in self._true_keys(edu):
-            suffix = mapping.get(key)
-            if not suffix:
-                continue
-            await safe_click(
-                self.page,
-                f"[data-qa='advanced-search__education-item-label_{suffix}']",
-                timeout=3000,
-            )
+        await self._set_filter_group("education", edu, key_map=mapping)
 
     async def _set_experience(self) -> None:
         """Задает опыт работы."""
         logger.debug("Задаем опыт работы")
         exp = self.search_params.get("experience") or {}
-        key = self._first_true_key(exp)
-        if not key:
-            return
-        # YAML uses doesntMatter, HH uses doesNotMatter
-        if key == "doesntMatter":
-            key = "doesNotMatter"
-        await safe_click(
-            self.page, f"[data-qa='advanced-search__experience-item-label_{key}']", timeout=3000
-        )
+        # Ключи совпадают с UI: noExperience, between1And3, between3And6, moreThan6.
+        # doesntMatter в текущем UI нет — при явном true будет понятная ошибка.
+        await self._set_filter_group("experience", exp)
 
     async def _set_employment(self) -> None:
         """Задает тип занятости."""
         logger.debug("Задаем тип занятости")
         employment = self.search_params.get("employment") or {}
-        enabled = self._true_keys(employment)
-        if not enabled:
+        if not employment:
             return
-
-        for key in enabled:
-            if key == "ACCEPT_TEMPORARY":
-                await safe_click(
-                    self.page,
-                    "[data-qa='advanced-search__accept_temporary-item']",
-                    timeout=3000,
-                )
-                await self.pause_async(0.5, 1)
-                continue
-
-            if key == "INTERNSHIP":
-                await safe_click(
-                    self.page,
-                    "xpath=//label[.//input[@name='label' and @value='internship']]",
-                    timeout=3000,
-                )
-                await self.pause_async(0.5, 1)
-                continue
-
-            await safe_click(
-                self.page,
-                f"xpath=//label[.//input[@name='employment_form' and @value='{key}']]",
-                timeout=3000,
-            )
-            await self.pause_async(0.5, 1)
+        standard = {
+            "FULL",
+            "PART",
+            "PROJECT",
+            "FLY_IN_FLY_OUT",
+        }
+        await self._set_filter_group(
+            "employment_form", {k: v for k, v in employment.items() if k in standard}
+        )
+        special = {k: v for k, v in employment.items() if k in ("INTERNSHIP", "ACCEPT_TEMPORARY")}
+        if special:
+            await self._set_filter_group("value", special)
 
     async def _set_job_format(self) -> None:
         """Задает формат работы."""
         logger.debug("Задаем формат работы")
         job_format = self.search_params.get("job_format") or {}
-        enabled = self._true_keys(job_format)
-        if not enabled:
-            return
-
-        for key in enabled:
-            if await safe_click(
-                self.page,
-                f"[data-qa='advanced-search__work_format-item-label_{key}']",
-                timeout=1500,
-            ):
-                await self.pause_async(0.5, 1)
-                continue
+        await self._set_filter_group("work_format", job_format)
 
     async def _set_vacancy_label(self) -> None:
         """Задает метки вакансий."""
         logger.debug("Задаем метки вакансий")
         labels = self.search_params.get("vacancy_label") or {}
-        for key in self._true_keys(labels):
-            await safe_click(
-                self.page, f"[data-qa='advanced-search__label-item-label_{key}']", timeout=3000
-            )
-            # advanced-search__label-item-label_accept_teens
+        await self._set_filter_group("label", labels)
 
     async def _set_order_by(self) -> None:
         """Задает сортировку."""
@@ -788,10 +1352,25 @@ class PlaywrightJobManager:
         key = self._first_true_key(order_by)
         if not key:
             return
-        # relevance is typically default; still allow click if user asked.
-        await safe_click(
-            self.page, f"[data-qa='advanced-search__order_by-item-label_{key}']", timeout=3000
+        # relevance — поведение по умолчанию, отдельный элемент не требуется
+        if key == "relevance":
+            return
+        trigger = self.page.locator(
+            "xpath=//*[self::button or self::span or self::div][normalize-space(text())='Сортировка']"
         )
+        if await trigger.count() == 0:
+            raise SearchSetupError(
+                f"Не найден элемент сортировки для '{key}' в текущем интерфейсе hh.ru"
+            )
+        if not await self._robust_click(trigger, what=f"сортировка '{key}'", timeout=5000):
+            raise SearchSetupError(f"Не удалось задать сортировку '{key}'")
+        await self.pause_async(0.5, 1)
+        option = self.page.get_by_text(key, exact=True)
+        if await option.count() == 0 or not await self._robust_click(
+            option, what=f"сортировка '{key}'", timeout=5000
+        ):
+            raise SearchSetupError(f"Не найден вариант сортировки '{key}'")
+        await self.pause_async(0.5, 1)
 
     async def _set_period(self) -> None:
         """Задает период поиска."""
@@ -800,70 +1379,224 @@ class PlaywrightJobManager:
         key = self._first_true_key(period)
         if not key:
             return
-        mapping = {
-            "all_time": "0",
-            "month": "30",
-            "week": "7",
-            "three_days": "3",
-            "one_day": "1",
+        label_map = {
+            "all_time": "Всё время",
+            "month": "1 месяц",
+            "week": "1 неделя",
+            "three_days": "3 дня",
+            "one_day": "1 день",
         }
-        days = mapping.get(key)
-        if days is None:
+        label = label_map.get(key)
+        if not label:
             return
-        await safe_click(
-            self.page, f"[data-qa='advanced-search__search_period-item-label_{days}']", timeout=3000
-        )
+        menu = self.page.locator("[data-qa='search-period-menu']")
+        if await menu.count() == 0:
+            raise SearchSetupError("Не найден элемент периода поиска (search-period-menu)")
+        menu_text = re.sub(r"\s+", " ", (await menu.first.text_content()) or "")
+        if label.lower() in menu_text.lower():
+            return  # уже задано
+        if not await self._robust_click(menu, what="период поиска", timeout=5000):
+            raise SearchSetupError("Не удалось открыть меню периода поиска")
+        await self.pause_async(0.5, 1)
+        option = self.page.get_by_text(label, exact=True)
+        if await option.count() == 0 or not await self._robust_click(
+            option, what=f"период '{label}'", timeout=5000
+        ):
+            raise SearchSetupError(f"Не найден вариант периода '{label}' в меню")
+        await self.pause_async(0.5, 1)
 
     async def _set_show(self) -> None:
-        """Задает количество вакансий, которые будут отображаться на одной странице."""
-        logger.debug("Задаем количество вакансий, которые будут отображаться на одной странице")
+        """
+        Задает количество вакансий на странице (элемент вне панели).
+
+        Размер выдачи — параметр URL (items_on_page). Основная стратегия — выбор
+        через меню; после submit панель страница может перерисовываться и клики
+        теряются, поэтому операция повторяется с ожиданием стабильности. Если UI
+        не применил значение — гарантированный fallback: навигация по сохранённому
+        адресу поиска с параметром items_on_page.
+        """
+        logger.debug("Задаем количество вакансий на странице")
         show = self.search_params.get("show") or {}
         key = self._first_true_key(show)
         key_mapping = {"show_20": "20", "show_50": "50", "show_100": "100"}
-        if not key_mapping.get(key):
+        target = key_mapping.get(key)
+        if not target:
             return
 
-        # New Magritte UI
-        await safe_click(
-            self.page,
-            f"[data-qa='advanced-search__items_on_page-item-label_{key_mapping[key]}']",
-            timeout=3000,
+        menu = self.page.locator("[data-qa='items_on_page-menu']")
+        if await menu.count() == 0:
+            raise SearchSetupError("Не найден элемент размера страницы (items_on_page-menu)")
+
+        async def menu_text() -> str:
+            return re.sub(r"\s+", " ", (await menu.first.text_content()) or "").strip()
+
+        if re.match(rf"^{target}(\s|$)", await menu_text()):
+            logger.info(f"Размер страницы уже {target}")
+            self.search_page_url = self.page.url
+            return
+
+        options = self.page.locator("[data-qa^='magritte-select-option-']")
+        for attempt in range(1, 3):
+            await self._settle_search_page()
+
+            if re.match(rf"^{target}(\s|$)", await menu_text()):
+                break
+
+            if not await self._robust_click(menu, what="размер страницы", timeout=5000):
+                await self._close_page_size_menu()
+                continue
+
+            # Ждём, пока popup реально открылся
+            popup_open = False
+            for _ in range(10):
+                try:
+                    if await menu.first.get_attribute("aria-expanded") == "true":
+                        popup_open = True
+                        break
+                except Exception:
+                    break
+                await asyncio.sleep(0.3)
+            if not popup_open:
+                logger.warning(f"Popup размера страницы не открылся (попытка {attempt})")
+                await self._close_page_size_menu()
+                continue
+            await self.pause_async(0.5, 1)
+
+            picked = False
+            for i in range(await options.count()):
+                option = options.nth(i)
+                try:
+                    if not await option.is_visible():
+                        continue
+                except Exception:
+                    continue
+                qa = (await option.get_attribute("data-qa")) or ""
+                text = re.sub(r"\s+", " ", (await option.text_content() or "")).strip()
+                # На живом hh.ru текст опции «20 вакансий», data-qa «magritte-select-option-20»
+                if qa == f"magritte-select-option-{target}" or re.match(rf"^{target}(\s|$)", text):
+                    picked = await self._robust_click(option, what=f"размер {target}")
+                    break
+            if not picked:
+                exact = self.page.get_by_text(target, exact=True)
+                if await exact.count() > 0:
+                    picked = await self._robust_click(
+                        exact, what=f"размер {target}", timeout=3000
+                    )
+            if not picked:
+                logger.warning(f"Не найдена опция размера {target} (попытка {attempt})")
+                await self._close_page_size_menu()
+                continue
+
+            applied = False
+            for _ in range(self.PAGE_SIZE_VERIFY_POLLS):
+                if re.match(rf"^{target}(\s|$)", await menu_text()):
+                    applied = True
+                    break
+                await asyncio.sleep(0.5)
+            if applied:
+                # Сверяем условия в адресе: при смене размера параметры поиска
+                # не должны теряться; адрес сохраняется только после проверки
+                await self._validate_search_applied()
+                logger.info(f"Размер страницы применён: {target}")
+                return
+            logger.warning(f"Клик по размеру {target} не применился (попытка {attempt}), повторяю")
+            await self._close_page_size_menu()
+
+        # Гарантированный fallback: размер — URL-параметр, навигируем с ним
+        logger.warning("Размер не применился через меню, применяю через адрес (items_on_page)")
+        base = self.search_page_url or self.page.url
+        parsed = urllib.parse.urlparse(base)
+        query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+        query["items_on_page"] = [target]
+        new_url = urllib.parse.urlunparse(
+            parsed._replace(query=urllib.parse.urlencode(query, doseq=True))
         )
+        await self._goto_search_url(new_url)
+        await self._handle_interfering_messages()
+        try:
+            await self.page.wait_for_selector(
+                '[data-qa="vacancy-serp__vacancy"], [data-qa="empty-vacancy-search-block"]',
+                timeout=self.SEARCH_RESULTS_WAIT_MS,
+            )
+        except Exception:
+            logger.warning("Выдача не отрисовалась после смены размера страницы")
+
+        final_text = await menu_text()
+        if not re.match(rf"^{target}(\s|$)", final_text):
+            raise SearchSetupError(
+                f"Размер страницы не применён: ожидалось {target}, в меню «{final_text}»"
+            )
+        # Адрес навигации собрался из сохранённого (с условиями) — проверяем условия
+        await self._validate_search_applied()
+        logger.info(f"Размер страницы применён через адрес: {target}")
+
+    async def _settle_search_page(self) -> None:
+        """Ждёт, пока выдача отрисовалась и страница «успокоилась» (для кликов)."""
+        try:
+            await self.page.wait_for_selector(
+                '[data-qa="vacancy-serp__vacancy"], [data-qa="empty-vacancy-search-block"]',
+                timeout=8000,
+            )
+        except Exception:
+            pass
+        try:
+            await self.page.wait_for_load_state("networkidle", timeout=5000)
+        except Exception:
+            pass
+        await self.pause_async(0.5, 1)
+
+    async def _close_page_size_menu(self) -> None:
+        """Закрывает popup размера страницы (если открыт) и даёт паузу."""
+        try:
+            await self.page.keyboard.press("Escape")
+        except Exception:
+            pass
+        await self.pause_async(0.7, 1.2)
 
     async def get_vacancies_from_page(self, page_num: int = 0) -> List[Dict[str, Any]]:
-        """Получить вакансии с очередной страницы."""
-        # Pagination logic: check if we are on the requested page
+        """
+        Получить вакансии с указанной страницы выдачи.
+
+        Переходит по сохранённому адресу поиска (сохраняя все параметры).
+        Возвращает [] только для подтверждённой пустой выдачи; при ошибке hh.ru,
+        сбое сети или нераспознанной разметке — SearchPageError (а не []).
+        """
+        url = self._search_url_for_page(page_num)
+        logger.info(f"Переходим на страницу {page_num}: {url}")
+        await self._goto_search_url(url)
+        await self._handle_interfering_messages()
+
+        # Ждём появления карточек или явного маркера пустой выдачи
         try:
-            if not self.search_page_url:
-                self.search_page_url = self.page.url
+            await self.page.wait_for_selector(
+                '[data-qa="vacancy-serp__vacancy"], [data-qa="empty-vacancy-search-block"]',
+                timeout=self.SEARCH_RESULTS_WAIT_MS,
+            )
+        except Exception:
+            logger.warning("Карточки вакансий и маркер пустой выдачи не появились вовремя")
 
-            if "hh.ru" in self.search_page_url:
-                parsed = urllib.parse.urlparse(self.search_page_url)
-                query = urllib.parse.parse_qs(parsed.query)
-                current_page_param = query.get("page", ["0"])[0]
-
-                if int(current_page_param) != page_num:
-                    query["page"] = [str(page_num)]
-                    new_query = urllib.parse.urlencode(query, doseq=True)
-                    new_url = urllib.parse.urlunparse(parsed._replace(query=new_query))
-                    self.search_page_url = new_url
-                    logger.info(f"Переходим на страницу {page_num}: {new_url}")
-                    await self.page.goto(new_url)
-                    await self.pause_async(2, 3)
-        except Exception as e:
-            logger.warning(f"Error handling pagination: {e}")
-
-        vacancies = []
-        # New selector based on Magritte redesign
         cards = await self.page.locator('[data-qa="vacancy-serp__vacancy"]').all()
+        if not cards:
+            empty_marker = self.page.locator('[data-qa="empty-vacancy-search-block"]')
+            if await empty_marker.count() > 0 and await empty_marker.first.is_visible():
+                logger.info("Подтверждённая пустая выдача: вакансий нет")
+                return []
+            raise SearchPageError(
+                "На странице выдачи нет ни карточек вакансий, ни явного признака пустой выдачи — "
+                "вероятно, страница не загрузилась или разметка изменилась"
+            )
 
         logger.info(f"Найдено {len(cards)} вакансий на странице {page_num}")
-
+        vacancies: List[Dict[str, Any]] = []
         for card in cards:
             vac = await self._parse_vacancy_card(card)
             if vac:
                 vacancies.append(vac)
-
+        if not vacancies:
+            raise SearchPageError(
+                f"Карточки вакансий есть ({len(cards)}), но ни одну не удалось разобрать — "
+                "вероятно, разметка изменилась"
+            )
         return vacancies
 
     async def _parse_vacancy_card(self, card: Locator) -> Optional[Dict[str, Any]]:

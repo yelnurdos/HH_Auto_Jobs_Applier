@@ -38,8 +38,8 @@ def test_set_resume(search_customizer, sample_resume):
     assert search_customizer.resume == sample_resume
 
 
-def test_set_advanced_search_params(search_customizer, sample_resume):
-    """Test setting advanced search parameters"""
+def test_set_search_parameters(search_customizer, sample_resume):
+    """Test setting search parameters (contract: set_search_parameters)"""
     search_customizer.set_resume("12345", sample_resume)
 
     # Create parameters to test
@@ -61,7 +61,7 @@ def test_set_advanced_search_params(search_customizer, sample_resume):
     }
 
     # Call the method (should store raw config as-is; UI setup is done by Playwright manager)
-    search_customizer.set_advanced_search_params(parameters)
+    search_customizer.set_search_parameters(parameters)
 
     assert search_customizer.search_params == parameters
 
@@ -70,9 +70,10 @@ def test_set_advanced_search_params(search_customizer, sample_resume):
 async def test_start_search_calls_manager(search_customizer, manager, sample_resume):
     search_customizer.set_resume("abc123", sample_resume)
     params = {"keywords": "python"}
-    search_customizer.set_advanced_search_params(params)
+    search_customizer.set_search_parameters(params)
 
     await search_customizer.start_search()
 
-    manager.start_search.assert_awaited_once_with("abc123")
-    manager.set_advanced_search_params.assert_awaited_once_with(params)
+    manager.set_advanced_search_params.assert_awaited_once_with(params, "abc123")
+    # Новый поиск не идёт через страницу резюме
+    manager.start_search.assert_not_awaited()

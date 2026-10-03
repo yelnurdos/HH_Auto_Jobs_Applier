@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>hh.ru search (test fixture)</title>
+</head>
+<body>
+  <h1>Вакансии</h1>
+
+  <!-- Верхнее поле поиска -->
+  <input data-qa="search-input" name="text" value="" aria-label="Поиск по вакансиям">
+
+  <!-- Кнопка «Фильтры» -->
+  <button type="button" data-qa="catalog-search-extra-filters" onclick="openDrawer()">
+    <span class="magritte-button__label">Фильтры</span>
+  </button>
+
+  <!-- Панель «Фильтры» (drawer) -->
+  <div id="drawer" data-qa="search-filters" role="dialog" style="display:none">
+    <h2>Фильтры</h2>
+
+    <input data-qa="vacancy-search-text-input" name="text" value="">
+
+    <label><input data-qa="search-filter-search_field-value-name" type="checkbox" name="search_field" value="name" checked> в названии вакансии</label>
+    <label><input data-qa="search-filter-search_field-value-company_name" type="checkbox" name="search_field" value="company_name" checked> в названии компании</label>
+    <label><input data-qa="search-filter-search_field-value-description" type="checkbox" name="search_field" value="description" checked> в описании вакансии</label>
+
+    <label><input data-qa="search-filter-value-with_salary" type="checkbox" value="with_salary" checked> Только с зарплатой</label>
+
+    <!-- Блок регионов -->
+    <div data-qa="filter-select-area">
+      <input data-qa="chips-trigger-input" id="area-input" oninput="areaSuggest()" placeholder="Поиск региона">
+      <span id="area-chips"></span>
+      <ul id="area-suggest" style="display:none"></ul>
+    </div>
+
+    <button type="button" data-qa="search-drawer-filters-submit" onclick="applyFilters()">Применить</button>
+    <button type="button" data-qa="search-filters-close" onclick="closeDrawer()">Закрыть</button>
+  </div>
+
+  <!-- Выдача -->
+  <div id="results" data-qa="serp"></div>
+
+  <!-- Размер страницы (вне панели) -->
+  <div data-qa="items_on_page-menu" id="page-size" role="combobox" aria-expanded="false" onclick="togglePageSize()">
+    <span id="page-size-label">/*__PAGE_SIZE_DEFAULT__*/</span> вакансий
+  </div>
+  <div id="page-size-menu" style="display:none">
+    <span data-qa="magritte-select-option-20" onclick="pickPageSize(this, '20')">20 вакансий</span>
+    <span data-qa="magritte-select-option-50" onclick="pickPageSize(this, '50')">50 вакансий</span>
+    <span data-qa="magritte-select-option-100" onclick="pickPageSize(this, '100')">100 вакансий</span>
+  </div>
+
+<script>
+  const REGIONS = /*__REGIONS__*/null;
+  const SUGGESTION_DELAY = /*__SUGGESTION_DELAY__*/0;
+  // Тест-патч: имитация потери условий при отправке панели (R1)
+  const APPLY_PATCH = {
+    dropText: /*__APPLY_DROP_TEXT__*/false,
+    dropAreas: /*__APPLY_DROP_AREAS__*/[],
+    uncheck: /*__APPLY_UNCHECK_FLAGS__*/[],
+    dropFlags: /*__APPLY_DROP_FLAGS__*/[]
+  };
+  // R1a: после выбора подсказка удаляется из DOM (живое поведение hh.ru)
+  const CLEAR_SUGGESTIONS = /*__CLEAR_SUGGESTIONS__*/false;
+  // R3a: Enter в верхнем поле делает полноценную навигацию (как живое hh.ru)
+  const ENTER_NAVIGATES = /*__ENTER_NAVIGATES__*/false;
+
+  function topInput() {
+    return document.querySelector('[data-qa="search-input"]');
+  }
+
+  function openDrawer() {
+    const d = document.getElementById('drawer');
+    d.style.display = 'block';
+    // панель синхронизирует ключевые слова с верхним полем
+    const top = topInput();
+    if (top) {
+      document.querySelector('[data-qa="vacancy-search-text-input"]').value = top.value;
+    }
+  }
+
+  function closeDrawer() {
+    document.getElementById('drawer').style.display = 'none';
+  }
+
+  function areaSuggest() {
+    const q = document.getElementById('area-input').value.trim().toLowerCase();
+    const ul = document.getElementById('area-suggest');
+    if (!q) { ul.innerHTML = ''; ul.style.display = 'none'; return; }
+    const found = REGIONS.filter(r => r.name.toLowerCase().includes(q));
+    // Имитация живого hh.ru: подсказки приходят асинхронно, до этого
+    // в списке остаются старые опции предыдущего запроса
+    setTimeout(() => {
+      ul.innerHTML = '';
+      if (!found.length) { ul.style.display = 'none'; return; }
+      ul.style.display = 'block';
+      // Живое hh.ru: опции лежат внутри контейнера
+      // data-qa="magritte-select-option-list" (совпадает с префикс-селектором)
+      const box = document.createElement('div');
+      box.setAttribute('data-qa', 'magritte-select-option-list');
+      found.forEach(r => {
+        const li = document.createElement('li');
+        li.setAttribute('data-qa', 'magritte-select-option-' + r.id);
+        li.setAttribute('data-magritte-select-option', String(r.id));
+        li.textContent = r.name;
+        li.style.display = 'block';
+        li.onclick = () => pickRegion(r);
+        box.appendChild(li);
+      });
+      ul.appendChild(box);
+    }, SUGGESTION_DELAY);
+  }
+
+  function pickRegion(r) {
+    const span = document.createElement('span');
+    span.className = 'region-chip';
+    span.textContent = r.name;
+    span.setAttribute('data-area-id', r.id);
+    document.getElementById('area-chips').appendChild(span);
+    document.getElementById('area-input').value = '';
+    document.getElementById('area-suggest').style.display = 'none';
+    if (CLEAR_SUGGESTIONS) document.getElementById('area-suggest').innerHTML = '';
+  }
+
+  function applyFilters() {
+    const p = new URLSearchParams(location.search);
+    const top = topInput();
+    // тест-патч: флажки, которые «сброшены» при отправке
+    APPLY_PATCH.uncheck.forEach(k => {
+      const el = document.querySelector('[data-qa="search-filter-search_field-value-' + k + '"]');
+      if (el) el.checked = false;
+    });
+    p.set('text', (top && top.value) || 'data');
+    const areas = [...document.querySelectorAll('.region-chip')].map(c => c.getAttribute('data-area-id'));
+    areas.forEach(id => p.append('area', id));
+    if (APPLY_PATCH.dropText) p.delete('text');
+    APPLY_PATCH.dropAreas.forEach(id => {
+      const rest = p.getAll('area').filter(v => v !== String(id));
+      p.delete('area');
+      rest.forEach(v => p.append('area', v));
+    });
+    ['name', 'company_name', 'description'].forEach(k => {
+      const el = document.querySelector('[data-qa="search-filter-search_field-value-' + k + '"]');
+      // dropFlags: параметр не попадает в адрес, но чекбокс остаётся включённым
+      if (el && el.checked && !APPLY_PATCH.dropFlags.includes(k)) p.append('search_field', k);
+    });
+    const ws = document.querySelector('[data-qa="search-filter-value-with_salary"]');
+    if (ws && ws.checked) p.set('with_salary', 'true');
+    history.pushState({}, '', '?' + p.toString());
+    closeDrawer();
+    renderResults();
+  }
+
+  function renderResults() {
+    const box = document.getElementById('results');
+    box.innerHTML = '';
+    for (let i = 0; i < 3; i++) {
+      const card = document.createElement('div');
+      card.setAttribute('data-qa', 'vacancy-serp__vacancy');
+      const a = document.createElement('a');
+      a.setAttribute('data-qa', 'serp-item__title');
+      a.href = '/vacancy/' + (1000 + i);
+      a.textContent = 'Test Job ' + i;
+      card.appendChild(a);
+      const emp = document.createElement('a');
+      emp.setAttribute('data-qa', 'vacancy-serp__vacancy-employer');
+      emp.href = '/employer/55';
+      emp.textContent = 'TestCo';
+      card.appendChild(emp);
+      box.appendChild(card);
+    }
+  }
+
+  // Enter в верхнем поле запускает поиск
+  const topInputEl = topInput();
+  if (topInputEl) {
+    topInputEl.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        const p = new URLSearchParams(location.search);
+        p.set('text', e.target.value);
+        if (ENTER_NAVIGATES) {
+          // полноценная навигация (как живое hh.ru): сеть, possible 502
+          location.search = p.toString();
+          return;
+        }
+        history.pushState({}, '', '?' + p.toString());
+        renderResults();
+      }
+    });
+  }
+
+  function togglePageSize() {
+    const m = document.getElementById('page-size-menu');
+    const btn = document.getElementById('page-size');
+    const show = m.style.display === 'none';
+    m.style.display = show ? 'block' : 'none';
+    btn.setAttribute('aria-expanded', show ? 'true' : 'false');
+  }
+
+  function pickPageSize(el, n) {
+    if (/*__PICK_DISABLED__*/false) return; // имитация: клик не применяется
+    document.getElementById('page-size-label').textContent = n;
+    document.getElementById('page-size-menu').style.display = 'none';
+    document.getElementById('page-size').setAttribute('aria-expanded', 'false');
+    // как на живом hh.ru, размер попадает в адрес
+    const p = new URLSearchParams(location.search);
+    p.set('items_on_page', n);
+    history.pushState({}, '', '?' + p.toString());
+  }
+
+  // При загрузке учитываем items_on_page из адреса (как живое hh.ru)
+  (function () {
+    const ip = new URLSearchParams(location.search).get('items_on_page');
+    if (ip && ['20', '50', '100'].includes(ip)) {
+      document.getElementById('page-size-label').textContent = ip;
+    }
+  })();
+
+  renderResults();
+</script>
+</body>
+</html>
